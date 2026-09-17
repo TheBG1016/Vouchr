@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certifi — Decentralized Certificate Registry</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        shell:  { 900:'#0A1120', 800:'#0E1829', 700:'#182741', 600:'#243450' },
+        work:   '#ECEFF4',
+        patina: { DEFAULT:'#0E7C6B', dark:'#0A5F52', light:'#E1F1ED' },
+        brass:  { DEFAULT:'#A07634', light:'#F8EFDD' },
+        seal:   { DEFAULT:'#B23B2E', light:'#FAE8E5' },
+        ink:    '#0A1120',
+        muted:  '#5C6679',
+        line:   '#DCE1E9'
+      },
+      fontFamily: {
+        sans:  ['"IBM Plex Sans"','system-ui','sans-serif'],
+        serif: ['"Source Serif 4"','Georgia','serif'],
+        mono:  ['"IBM Plex Mono"','ui-monospace','monospace']
+      }
+    }
+  }
+}
+</script>
+
+<style>
+  body { background:#ECEFF4; font-family:"IBM Plex Sans",system-ui,sans-serif; }
+
+  /* Guilloche-style engine turning, the way a real certificate border is printed.
+     Pure CSS so there is nothing to download. */
+  .guilloche{
+    background-image:
+      repeating-radial-gradient(circle at 0% 50%, transparent 0 8px, rgba(14,124,107,.055) 8px 9px),
+      repeating-radial-gradient(circle at 100% 50%, transparent 0 8px, rgba(14,124,107,.055) 8px 9px);
+  }
+
+  /* The seal stamps down once, when a certificate appears. One moment of motion,
+     not a fade-and-slide on every element. */
+  @keyframes stamp{
+    0%   { transform: scale(1.6) rotate(-14deg); opacity:0 }
+    55%  { transform: scale(.94) rotate(3deg);   opacity:1 }
+    100% { transform: scale(1)   rotate(0deg);   opacity:1 }
+  }
+  .stamp{ animation: stamp .42s cubic-bezier(.2,.9,.3,1.1) both }
+  @media (prefers-reduced-motion: reduce){ .stamp{ animation:none } }
+
+  ::-webkit-scrollbar{ width:10px; height:10px }
+  ::-webkit-scrollbar-thumb{ background:#C3CAD6; border-radius:10px }
+  :focus-visible{ outline:2px solid #0E7C6B; outline-offset:2px }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo, createContext, useContext } = React;
+
+/* ═══════════════════════════════════════════════════════════════════
+   CONFIGURATION — EDIT THIS ONE LINE
+   Paste the address Remix gave you after deploying to Sepolia.
+   Leave it as-is to run in Demo mode with sample data.
+   ═══════════════════════════════════════════════════════════════════ */
+const CONTRACT_ADDRESS = "0x933958160a0fFb81daf4C5F10cabc08bbd1718FF";
+
+const PUBLIC_RPC    = "https://ethereum-sepolia-rpc.publicnode.com";
+const SEPOLIA_CHAIN = 11155111n;
+const CONFIGURED    = !CONTRACT_ADDRESS.startsWith("PASTE");
+
+const ABI = [
+  "function issueCertificate(string subjectName, string publicKey, uint256 validityDays) returns (uint256)",
+  "function revokeCertificate(uint256 id, string reason)",
+  "function verifyCertificate(uint256 id) view returns (bool valid, string status, address owner, string subjectName, string publicKey)",
+  "function getCertificate(uint256 id) view returns (tuple(uint256 id, address owner, string subjectName, string publicKey, bytes32 fingerprint, uint256 issuedAt, uint256 expiresAt, bool revoked, string revocationReason))",
+  "function getCertificatesByOwner(address owner) view returns (uint256[])",
+  "function totalCertificates() view returns (uint256)",
+  "event CertificateIssued(uint256 indexed id, address indexed owner, string subjectName, bytes32 indexed fingerprint, uint256 issuedAt, uint256 expiresAt)"
+];
+
+/* ═══════════════ helpers ═══════════════ */
+const b64  = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64= s   => Uint8Array.from(atob(s.trim()), c => c.charCodeAt(0)).buffer;
+const short= a   => a ? a.slice(0,6) + "…" + a.slice(-4) : "";
+const fmt  = ts  => new Date(Number(ts)*1000).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});
+const nowS = ()  => Math.floor(Date.now()/1000);
+
+function stateOf(c){
+  if (c.revoked) return "revoked";
+  if (Number(c.expiresAt) < nowS()) return "expired";
+  return "valid";
+}
+
+const TONE = {
+  valid:   { label:"Valid",   text:"text-patina", bg:"bg-patina-light", border:"border-patina",  ring:"ring-patina/25",  bar:"bg-patina"  },
+  expired: { label:"Expired", text:"text-brass",  bg:"bg-brass-light",  border:"border-brass",   ring:"ring-brass/25",   bar:"bg-brass"   },
+  revoked: { label:"Revoked", text:"text-seal",   bg:"bg-seal-light",   border:"border-seal",    ring:"ring-seal/25",    bar:"bg-seal"    }
+};
+
+/* ═══════════════ demo data (offline fallback + design preview) ═══════════════ */
+const DEMO_OWNER = "0x7A3f4C1b9D8e2F5a6B0c4D7e1F8a3B2c5D6E9f01";
+const demoSeed = () => ([
+  { id:1n, owner:DEMO_OWNER, subjectName:"Aarthi Raman",  publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7pQ2mKcVn1sXbQzYh0RtL9dGfW3aJ4uC",
+    fingerprint:"0x9c41ab77e2d0f5183ba6c9e4d217f80b3ac5e6d918f2b7c04a5e3d6f1b8c2094",
+    issuedAt:BigInt(nowS()-86400*41), expiresAt:BigInt(nowS()+86400*324), revoked:false, revocationReason:"" },
+  { id:2n, owner:DEMO_OWNER, subjectName:"Salem Node Operator", publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEm2XvR8pL0dYtQ6hN4sB7cF1gA9eJ3kZu",
+    fingerprint:"0x4e72d5c1980ab3f6e2470dc85b19f3a7e6d0c284519bf7a3e0d64c2b85f19730",
+    issuedAt:BigInt(nowS()-86400*180), expiresAt:BigInt(nowS()-86400*4), revoked:false, revocationReason:"" },
+  { id:3n, owner:DEMO_OWNER, subjectName:"Test Mail Relay", publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEq7HsT2nW5fX8bK1yE4vC0dR6gM9jP3aL",
+    fingerprint:"0xd81f30a95c6e2b47f09d1538ea7c04b62e93f5a108dc74b6e2f0a95318cd7402",
+    issuedAt:BigInt(nowS()-86400*95), expiresAt:BigInt(nowS()+86400*270), revoked:true, revocationReason:"Private key compromised" }
+]);
+
+/* ═══════════════ chain context ═══════════════ */
+const Chain = createContext(null);
+const useChain = () => useContext(Chain);
+
+function ChainProvider({children}){
+  const [account,setAccount] = useState(null);
+  const [chainOk,setChainOk] = useState(true);
+  const [demo,setDemo]       = useState(!CONFIGURED);
+  const [demoCerts,setDemoCerts] = useState(demoSeed);
+  const [signer,setSigner]   = useState(null);
+
+  const connect = useCallback(async () => {
+    if (!window.ethereum) throw new Error("MetaMask is not installed in this browser.");
+    const p = new ethers.BrowserProvider(window.ethereum);
+    await p.send("eth_requestAccounts", []);
+    const s = await p.getSigner();
+    const n = await p.getNetwork();
+    setSigner(s); setAccount(await s.getAddress()); setChainOk(n.chainId === SEPOLIA_CHAIN);
+  }, []);
+
+  useEffect(() => {
+    window.ethereum?.on?.('accountsChanged', () => location.reload());
+    window.ethereum?.on?.('chainChanged',   () => location.reload());
+  }, []);
+
+  const read  = () => new ethers.Contract(CONTRACT_ADDRESS, ABI, new ethers.JsonRpcProvider(PUBLIC_RPC));
+  const write = () => { if(!signer) throw new Error("Connect your wallet first."); return new ethers.Contract(CONTRACT_ADDRESS, ABI, signer); };
+
+  /* One API whether we are on chain or in demo mode. */
+  const api = useMemo(() => ({
+    async list(){
+      if (demo) return demoCerts;
+      const c = read();
+      const ids = await c.getCertificatesByOwner(account);
+      return Promise.all(ids.map(i => c.getCertificate(i)));
+    },
+    async get(id){
+      if (demo) return demoCerts.find(c => c.id === BigInt(id)) || null;
+      try { return await read().getCertificate(id); } catch { return null; }
+    },
+    async issue(name, key, days){
+      if (demo){
+        const id = BigInt(demoCerts.length + 1);
+        const cert = { id, owner:account||DEMO_OWNER, subjectName:name, publicKey:key,
+          fingerprint:"0x"+Array.from({length:64},()=>"0123456789abcdef"[Math.random()*16|0]).join(""),
+          issuedAt:BigInt(nowS()), expiresAt:BigInt(nowS()+days*86400), revoked:false, revocationReason:"" };
+        setDemoCerts(p => [...p, cert]);
+        return { id:id.toString(), hash:null };
+      }
+      const c  = write();
+      const tx = await c.issueCertificate(name, key, days);
+      const r  = await tx.wait();
+      let id = "?";
+      for (const log of r.logs){
+        try { const p = c.interface.parseLog(log); if (p?.name === "CertificateIssued"){ id = p.args.id.toString(); break; } } catch(_){}
+      }
+      return { id, hash: tx.hash };
+    },
+    async revoke(id, reason){
+      if (demo){
+        setDemoCerts(p => p.map(c => c.id === BigInt(id) ? {...c, revoked:true, revocationReason:reason} : c));
+        return { hash:null };
+      }
+      const tx = await write().revokeCertificate(id, reason);
+      await tx.wait();
+      return { hash: tx.hash };
+    }
+  }), [demo, demoCerts, account, signer]);
+
+  return <Chain.Provider value={{account,chainOk,demo,setDemo,connect,api}}>{children}</Chain.Provider>;
+}
+
+/* ═══════════════ primitives ═══════════════ */
+function Field({label, hint, children}){
+  return (
+    <div className="mb-5">
+      <label className="block text-[13px] font-medium text-ink mb-1.5">{label}</label>
+      {children}
+      {hint && <p className="text-[12px] text-muted mt-1.5 max-w-[58ch]">{hint}</p>}
+    </div>
+  );
+}
+const inputCls = "w-full rounded-lg border border-line bg-white px-3.5 py-2.5 text-[14px] text-ink placeholder:text-muted/60 focus:border-patina focus:outline-none focus:ring-2 focus:ring-patina/20";
+const areaCls  = inputCls + " font-mono text-[12px] leading-relaxed min-h-[84px] resize-y";
+
+function Button({children, kind="primary", busy, ...rest}){
+  const styles = {
+    primary: "bg-patina text-white hover:bg-patina-dark",
+    quiet:   "bg-white text-ink border border-line hover:border-muted",
+    danger:  "bg-seal text-white hover:brightness-110"
+  }[kind];
+  return (
+    <button {...rest} disabled={busy || rest.disabled}
+      className={`inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-[14px] font-semibold transition disabled:opacity-45 disabled:cursor-not-allowed ${styles}`}>
+      {busy && <span className="h-3.5 w-3.5 rounded-full border-2 border-current border-t-transparent animate-spin" />}
+      {children}
+    </button>
+  );
+}
+
+function Notice({tone, children}){
+  if (!children) return null;
+  const map = { ok:"bg-patina-light text-patina-dark border-patina/30", warn:"bg-brass-light text-brass border-brass/30",
+                bad:"bg-seal-light text-seal border-seal/30", info:"bg-white text-muted border-line" };
+  return <div className={`mt-5 rounded-lg border px-4 py-3 text-[13.5px] break-words ${map[tone||'info']}`}>{children}</div>;
+}
+
+function Panel({title, lead, children, aside}){
+  return (
+    <section className="rounded-xl border border-line bg-white p-6 md:p-7 mb-6">
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-6">
+        <div>
+          <h2 className="font-serif text-[21px] font-semibold text-ink leading-tight">{title}</h2>
+          {lead && <p className="text-[14px] text-muted mt-1 max-w-[62ch]">{lead}</p>}
+        </div>
+        {aside}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/* ═══════════════ the certificate, drawn as a document ═══════════════ */
+function Seal({state, size=64}){
+  const t = TONE[state];
+  return (
+    <div className={`stamp shrink-0 rounded-full border-2 ${t.border} ${t.bg} flex items-center justify-center`}
+         style={{width:size, height:size}}>
+      <div className={`rounded-full border ${t.border} flex items-center justify-center`}
+           style={{width:size-10, height:size-10}}>
+        <span className={`font-serif font-bold leading-none ${t.text}`} style={{fontSize:size*0.19}}>
+          {t.label}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function CertificateDoc({cert, onRevoke, compact}){
+  const st = stateOf(cert), t = TONE[st];
+  return (
+    <article className={`relative overflow-hidden rounded-xl border ${t.border}/40 bg-white`}>
+      <div className={`absolute inset-x-0 top-0 h-1 ${t.bar}`} />
+      <div className="guilloche absolute inset-0 pointer-events-none opacity-70" />
+      <div className="relative p-6">
+        <div className="flex items-start justify-between gap-5">
+          <div className="min-w-0">
+            <p className="text-[12px] text-muted">Certificate No. {cert.id.toString()}</p>
+            <h3 className="font-serif text-[24px] font-semibold text-ink leading-tight mt-0.5 truncate">
+              {cert.subjectName}
+            </h3>
+            <p className="font-mono text-[11.5px] text-muted mt-1.5 truncate">{cert.owner}</p>
+          </div>
+          <Seal state={st} size={compact ? 56 : 68} />
+        </div>
+
+        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-line pt-4 text-[13px]">
+          <div><dt className="text-muted text-[12px]">Issued</dt><dd className="text-ink">{fmt(cert.issuedAt)}</dd></div>
+          <div><dt className="text-muted text-[12px]">Expires</dt><dd className="text-ink">{fmt(cert.expiresAt)}</dd></div>
+          <div className="col-span-2">
+            <dt className="text-muted text-[12px]">Key fingerprint</dt>
+            <dd className="font-mono text-[11.5px] text-ink break-all">{cert.fingerprint}</dd>
+          </div>
+          {cert.revoked && (
+            <div className="col-span-2">
+              <dt className="text-muted text-[12px]">Revocation reason</dt>
+              <dd className="text-seal">{cert.revocationReason || "Not specified"}</dd>
+            </div>
+          )}
+        </div>
+
+        {onRevoke && st === "valid" && (
+          <div className="mt-5 border-t border-line pt-4">
+            <button onClick={() => onRevoke(cert)}
+              className="text-[13px] font-semibold text-seal hover:underline">
+              Revoke this certificate
+            </button>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
+/* ═══════════════ 1. Overview ═══════════════ */
+function Overview({go}){
+  const { api, account, demo } = useChain();
+  const [certs,setCerts] = useState([]);
+  const [loading,setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try { setCerts(await api.list()); } catch { setCerts([]); }
+      setLoading(false);
+    })();
+  }, [api, account]);
+
+  const counts = certs.reduce((a,c) => { a[stateOf(c)]++; return a; }, {valid:0,expired:0,revoked:0});
+  const featured = certs.find(c => stateOf(c) === "valid") || certs[0];
+
+  return (
+    <div>
+      <div className="mb-7">
+        <h1 className="font-serif text-[30px] font-semibold text-ink leading-tight">Registry overview</h1>
+        <p className="text-[14.5px] text-muted mt-1 max-w-[62ch]">
+          Certificates issued by your address, read directly from the smart contract.
+          No authority approves, mediates or can alter any of them.
+        </p>
+      </div>
+
+      {/* Hero: a real certificate, not a big number. */}
+      {loading ? (
+        <div className="h-52 rounded-xl border border-line bg-white animate-pulse mb-6" />
+      ) : featured ? (
+        <div className="grid lg:grid-cols-[1.4fr_1fr] gap-6 mb-6">
+          <CertificateDoc cert={featured} />
+          <div className="rounded-xl border border-line bg-shell-900 text-white p-6 flex flex-col justify-between">
+            <div>
+              <h3 className="font-serif text-[19px] font-semibold">Certificate lifecycle</h3>
+              <ol className="mt-4 space-y-2.5">
+                {["Generate keys","Issue certificate","Store on chain","Public verification","Signature check","Revocation"].map((s,i) => (
+                  <li key={s} className="flex items-center gap-3 text-[13.5px] text-white/75">
+                    <span className="h-6 w-6 shrink-0 rounded-full bg-white/10 text-white font-serif text-[12px] font-bold flex items-center justify-center">{i+1}</span>
+                    {s}
+                  </li>
+                ))}
+              </ol>
+            </div>
+            <button onClick={() => go('issue')}
+              className="mt-6 rounded-lg bg-patina px-4 py-2.5 text-[14px] font-semibold hover:bg-patina-dark transition">
+              Issue a certificate
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-xl border border-dashed border-line bg-white p-12 text-center mb-6">
+          <h3 className="font-serif text-[20px] font-semibold text-ink">No certificates yet</h3>
+          <p className="text-[14px] text-muted mt-1.5 mb-5 max-w-[46ch] mx-auto">
+            Generate a key pair, then issue your first certificate. It takes about a minute.
+          </p>
+          <Button onClick={() => go('keys')}>Generate a key pair</Button>
+        </div>
+      )}
+
+      <div className="grid sm:grid-cols-3 gap-4">
+        {["valid","expired","revoked"].map(k => {
+          const t = TONE[k];
+          return (
+            <div key={k} className="rounded-xl border border-line bg-white p-5">
+              <div className="flex items-center gap-2.5">
+                <span className={`h-2.5 w-2.5 rounded-full ${t.bar}`} />
+                <span className="text-[13px] text-muted">{t.label}</span>
+              </div>
+              <p className="font-serif text-[34px] font-semibold text-ink mt-1 leading-none">{counts[k]}</p>
+            </div>
+          );
+        })}
+      </div>
+
+      {demo && (
+        <p className="mt-6 text-[12.5px] text-muted">
+          Showing sample data. Set <code className="font-mono">CONTRACT_ADDRESS</code> in this file to read from Sepolia.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════ 2. Keys ═══════════════ */
+function Keys({stash}){
+  const [pair,setPair] = useState(null);
+  const [pub,setPub]   = useState("");
+  const [msg,setMsg]   = useState(null);
+
+  const gen = async () => {
+    try{
+      const kp = await crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"}, true, ["sign","verify"]);
+      const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
+      setPair(kp); setPub(b64(spki)); stash(b64(spki));
+      setMsg({tone:"ok", text:"Key pair created in this browser. Download the private key before you leave this page."});
+    }catch(e){ setMsg({tone:"bad", text:"Could not generate keys: "+e.message}); }
+  };
+
+  const download = async () => {
+    const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(jwk,null,2)],{type:"application/json"}));
+    a.download = "private-key.json"; a.click(); URL.revokeObjectURL(a.href);
+    setMsg({tone:"ok", text:"Private key saved to your downloads. It was never transmitted anywhere."});
+  };
+
+  return (
+    <div>
+      <h1 className="font-serif text-[30px] font-semibold text-ink mb-7">Key generation</h1>
+      <Panel title="Create a key pair"
+        lead="Your browser generates an ECDSA P-256 key pair using the built-in Web Crypto API. The private key stays on your machine; only the public key is published to the blockchain.">
+        <div className="flex flex-wrap gap-3">
+          <Button onClick={gen}>Generate key pair</Button>
+          <Button kind="quiet" onClick={download} disabled={!pair}>Download private key</Button>
+        </div>
+
+        {pub && (
+          <div className="mt-6">
+            <Field label="Public key — base64 SPKI"
+              hint="This is safe to share publicly. It has been copied into the Issue form for you.">
+              <textarea readOnly value={pub} className={areaCls} />
+            </Field>
+          </div>
+        )}
+
+        <Notice tone={msg?.tone}>{msg?.text}</Notice>
+
+        <div className="mt-6 rounded-lg border border-brass/30 bg-brass-light px-4 py-3.5">
+          <p className="text-[13px] text-brass leading-relaxed">
+            Keep <span className="font-mono">private-key.json</span> somewhere safe. You need it to sign messages.
+            If it is ever exposed, that is precisely when you revoke the certificate.
+          </p>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ═══════════════ 3. Issue ═══════════════ */
+function Issue({stashed, go}){
+  const { api, demo, account } = useChain();
+  const [name,setName] = useState("");
+  const [key,setKey]   = useState(stashed || "");
+  const [days,setDays] = useState(365);
+  const [busy,setBusy] = useState(false);
+  const [msg,setMsg]   = useState(null);
+
+  useEffect(() => { if (stashed) setKey(stashed); }, [stashed]);
+
+  const submit = async () => {
+    if (!name.trim())  return setMsg({tone:"warn", text:"Enter a subject name."});
+    if (!key.trim())   return setMsg({tone:"warn", text:"Generate or paste a public key."});
+    if (!(days>=1 && days<=3650)) return setMsg({tone:"warn", text:"Validity must be between 1 and 3650 days."});
+    if (!demo && !account) return setMsg({tone:"warn", text:"Connect your wallet before issuing."});
+
+    setBusy(true); setMsg({tone:"info", text:"Confirm the transaction in MetaMask…"});
+    try{
+      const r = await api.issue(name.trim(), key.trim(), Number(days));
+      setMsg({tone:"ok", text:<span>
+        Certificate <strong>No. {r.id}</strong> issued.{" "}
+        {r.hash
+          ? <a className="underline" target="_blank" rel="noopener" href={`https://sepolia.etherscan.io/tx/${r.hash}`}>View the transaction on Etherscan</a>
+          : "Open Certificates to see it."}
+      </span>});
+      setName("");
+    }catch(e){ setMsg({tone:"bad", text:"Issue failed: " + (e.reason || e.shortMessage || e.message)}); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <h1 className="font-serif text-[30px] font-semibold text-ink mb-7">Issue a certificate</h1>
+      <div className="grid lg:grid-cols-[1.3fr_1fr] gap-6 items-start">
+        <Panel title="Certificate details"
+          lead="You are both the issuer and the owner. No authority signs off on this — the contract accepts it because the transaction came from your address.">
+          <Field label="Subject name" hint="The identity this certificate attests to.">
+            <input className={inputCls} value={name} maxLength={128}
+              onChange={e=>setName(e.target.value)} placeholder="e.g. Aarthi Raman" />
+          </Field>
+          <Field label="Public key" hint="Generated on the Keys page, or pasted from elsewhere.">
+            <textarea className={areaCls} value={key} onChange={e=>setKey(e.target.value)}
+              placeholder="Base64 SPKI public key" />
+          </Field>
+          <Field label="Valid for" hint="Between 1 and 3650 days. The contract computes the expiry from the block timestamp.">
+            <div className="flex items-center gap-3">
+              <input type="number" min="1" max="3650" className={inputCls + " max-w-[140px]"}
+                value={days} onChange={e=>setDays(e.target.value)} />
+              <span className="text-[13.5px] text-muted">days</span>
+            </div>
+          </Field>
+          <Button onClick={submit} busy={busy}>Issue certificate</Button>
+          <Notice tone={msg?.tone}>{msg?.text}</Notice>
+        </Panel>
+
+        <div className="rounded-xl border border-line bg-white p-6">
+          <h3 className="font-serif text-[17px] font-semibold text-ink">Preview</h3>
+          <p className="text-[13px] text-muted mt-1 mb-5">How this will look once it is on chain.</p>
+          <CertificateDoc compact cert={{
+            id: 0n, owner: account || DEMO_OWNER,
+            subjectName: name || "Subject name",
+            publicKey: key,
+            fingerprint: key ? "Computed on chain as keccak256 of your public key" : "Awaiting a public key",
+            issuedAt: BigInt(nowS()),
+            expiresAt: BigInt(nowS() + (Number(days)||0)*86400),
+            revoked: false, revocationReason: ""
+          }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ 4. Certificates ═══════════════ */
+function Certificates(){
+  const { api, account, demo } = useChain();
+  const [certs,setCerts]     = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [filter,setFilter]   = useState("all");
+  const [target,setTarget]   = useState(null);
+  const [reason,setReason]   = useState("Private key compromised");
+  const [busy,setBusy]       = useState(false);
+  const [msg,setMsg]         = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setCerts(await api.list()); } catch(e){ setMsg({tone:"bad", text:"Could not load: "+(e.shortMessage||e.message)}); }
+    setLoading(false);
+  }, [api]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const shown = certs.filter(c => filter === "all" || stateOf(c) === filter);
+
+  const doRevoke = async () => {
+    setBusy(true);
+    try{
+      const r = await api.revoke(target.id, reason || "Not specified");
+      setMsg({tone:"ok", text:<span>
+        Certificate No. {target.id.toString()} revoked. Every verification from now on reports it as revoked.{" "}
+        {r.hash && <a className="underline" target="_blank" rel="noopener" href={`https://sepolia.etherscan.io/tx/${r.hash}`}>Transaction</a>}
+      </span>});
+      setTarget(null); load();
+    }catch(e){ setMsg({tone:"bad", text:"Revocation failed: " + (e.reason||e.shortMessage||e.message)}); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-end justify-between gap-4 mb-7">
+        <div>
+          <h1 className="font-serif text-[30px] font-semibold text-ink leading-tight">Certificates</h1>
+          <p className="text-[14.5px] text-muted mt-1">
+            {demo ? "Sample registry" : account ? `Issued by ${short(account)}` : "Connect a wallet to see your certificates"}
+          </p>
+        </div>
+        <div className="flex gap-1 rounded-lg border border-line bg-white p-1">
+          {["all","valid","expired","revoked"].map(f => (
+            <button key={f} onClick={()=>setFilter(f)}
+              className={`rounded-md px-3 py-1.5 text-[13px] font-medium capitalize transition ${
+                filter===f ? "bg-shell-900 text-white" : "text-muted hover:text-ink"}`}>
+              {f}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <Notice tone={msg?.tone}>{msg?.text}</Notice>
+
+      {loading ? (
+        <div className="grid md:grid-cols-2 gap-5 mt-5">
+          {[0,1].map(i => <div key={i} className="h-60 rounded-xl border border-line bg-white animate-pulse" />)}
+        </div>
+      ) : shown.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-line bg-white p-12 text-center mt-5">
+          <h3 className="font-serif text-[19px] font-semibold text-ink">Nothing here</h3>
+          <p className="text-[14px] text-muted mt-1.5">
+            {filter === "all" ? "Issue a certificate to get started." : `No ${filter} certificates.`}
+          </p>
+        </div>
+      ) : (
+        <div className="grid md:grid-cols-2 gap-5 mt-5">
+          {shown.map(c => <CertificateDoc key={c.id.toString()} cert={c} onRevoke={setTarget} />)}
+        </div>
+      )}
+
+      {/* revoke confirmation */}
+      {target && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-shell-900/60 p-4" onClick={()=>!busy&&setTarget(null)}>
+          <div className="w-full max-w-md rounded-xl bg-white p-6" onClick={e=>e.stopPropagation()}>
+            <h3 className="font-serif text-[20px] font-semibold text-ink">Revoke certificate No. {target.id.toString()}?</h3>
+            <p className="text-[13.5px] text-muted mt-2">
+              Revocation is permanent. The contract has no way to reverse it, deliberately — an
+              un-revoke function would let an attacker restore a compromised certificate.
+            </p>
+            <div className="mt-5">
+              <Field label="Reason">
+                <input className={inputCls} value={reason} onChange={e=>setReason(e.target.value)} />
+              </Field>
+            </div>
+            <div className="flex gap-3">
+              <Button kind="danger" onClick={doRevoke} busy={busy}>Revoke permanently</Button>
+              <Button kind="quiet" onClick={()=>setTarget(null)} disabled={busy}>Cancel</Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════ 5. Verify ═══════════════ */
+function Verify(){
+  const { api } = useChain();
+  const [id,setId]     = useState("");
+  const [busy,setBusy] = useState(false);
+  const [res,setRes]   = useState(undefined);
+
+  const check = async () => {
+    if (!id) return;
+    setBusy(true); setRes(undefined);
+    try { setRes(await api.get(id)); } catch { setRes(null); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <h1 className="font-serif text-[30px] font-semibold text-ink mb-1">Verify a certificate</h1>
+      <p className="text-[14.5px] text-muted mb-7 max-w-[62ch]">
+        Anyone can run this check — no wallet, no account, no permission. It reads a public
+        blockchain and costs nothing, because verification is a view function.
+      </p>
+
+      <Panel title="Look up by certificate number">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="flex-1 min-w-[200px]">
+            <Field label="Certificate number">
+              <input type="number" min="1" className={inputCls} value={id}
+                onChange={e=>setId(e.target.value)} onKeyDown={e=>e.key==='Enter'&&check()} placeholder="e.g. 1" />
+            </Field>
+          </div>
+          <div className="mb-5"><Button onClick={check} busy={busy}>Check status</Button></div>
+        </div>
+
+        {res === null && (
+          <div className="rounded-xl border border-line bg-work p-8 text-center">
+            <p className="font-serif text-[28px] font-semibold text-muted">Not found</p>
+            <p className="text-[13.5px] text-muted mt-1">No certificate with that number exists in this registry.</p>
+          </div>
+        )}
+
+        {res && (
+          <div>
+            <div className={`rounded-xl border ${TONE[stateOf(res)].border}/40 ${TONE[stateOf(res)].bg} p-7 flex items-center gap-6 mb-5`}>
+              <Seal state={stateOf(res)} size={84} />
+              <div className="min-w-0">
+                <p className={`font-serif text-[34px] font-semibold leading-none ${TONE[stateOf(res)].text}`}>
+                  {TONE[stateOf(res)].label}
+                </p>
+                <p className="text-[14px] text-ink mt-2">
+                  {stateOf(res)==="valid"   && "This certificate is active and can be trusted."}
+                  {stateOf(res)==="expired" && "The validity period has ended. Signatures made with this key should no longer be accepted."}
+                  {stateOf(res)==="revoked" && "The owner revoked this certificate. Do not trust anything signed with this key."}
+                </p>
+              </div>
+            </div>
+            <CertificateDoc cert={res} />
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/* ═══════════════ 6. Signatures ═══════════════ */
+function Signatures(){
+  const { api } = useChain();
+  const [priv,setPriv]   = useState(null);
+  const [msgIn,setMsgIn] = useState("");
+  const [sig,setSig]     = useState("");
+  const [note,setNote]   = useState(null);
+
+  const [vId,setVId]   = useState("");
+  const [vMsg,setVMsg] = useState("");
+  const [vSig,setVSig] = useState("");
+  const [vBusy,setVBusy] = useState(false);
+  const [verdict,setVerdict] = useState(null);
+
+  const loadKey = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try{
+      const jwk = JSON.parse(await f.text());
+      setPriv(await crypto.subtle.importKey("jwk", jwk, {name:"ECDSA",namedCurve:"P-256"}, false, ["sign"]));
+      setNote({tone:"ok", text:"Private key loaded into this browser session only."});
+    }catch(err){ setPriv(null); setNote({tone:"bad", text:"That file is not a valid private key: "+err.message}); }
+  };
+
+  const sign = async () => {
+    if (!priv)  return setNote({tone:"warn", text:"Load your private key file first."});
+    if (!msgIn) return setNote({tone:"warn", text:"Enter a message to sign."});
+    const s = await crypto.subtle.sign({name:"ECDSA",hash:"SHA-256"}, priv, new TextEncoder().encode(msgIn));
+    const enc = b64(s);
+    setSig(enc); setVSig(enc); setVMsg(msgIn);
+    setNote({tone:"ok", text:"Message signed. The signature and message have been copied into the verifier."});
+  };
+
+  const verify = async () => {
+    if (!vId || !vMsg || !vSig) return setVerdict({k:"warn", title:"Incomplete", body:"Fill in the certificate number, message and signature."});
+    setVBusy(true); setVerdict(null);
+    try{
+      const cert = await api.get(vId);
+      if (!cert) { setVBusy(false); return setVerdict({k:"bad", title:"Rejected", body:"No certificate with that number exists."}); }
+      const st = stateOf(cert);
+      if (st !== "valid"){
+        setVBusy(false);
+        return setVerdict({k:"bad", title:"Rejected", body:`The signature may be mathematically correct, but certificate No. ${vId} is ${TONE[st].label.toLowerCase()}. It cannot be trusted.`});
+      }
+      const pk = await crypto.subtle.importKey("spki", unb64(cert.publicKey), {name:"ECDSA",namedCurve:"P-256"}, false, ["verify"]);
+      const ok = await crypto.subtle.verify({name:"ECDSA",hash:"SHA-256"}, pk, unb64(vSig), new TextEncoder().encode(vMsg));
+      setVerdict(ok
+        ? {k:"ok",  title:"Authentic", body:`Signed by ${cert.subjectName}, whose certificate is valid on chain.`}
+        : {k:"bad", title:"Invalid",   body:"The signature does not match this message and public key. The message was altered, or a different key signed it."});
+    }catch(e){
+      setVerdict({k:"bad", title:"Could not verify", body: e.reason || e.shortMessage || e.message});
+    }
+    setVBusy(false);
+  };
+
+  const vTone = {ok:TONE.valid, bad:TONE.revoked, warn:TONE.expired};
+
+  return (
+    <div>
+      <h1 className="font-serif text-[30px] font-semibold text-ink mb-1">Signatures</h1>
+      <p className="text-[14.5px] text-muted mb-7 max-w-[62ch]">
+        This is what a PKI is actually for. Sign something with your private key, then let
+        anyone check it against the public key stored on the blockchain.
+      </p>
+
+      <div className="grid lg:grid-cols-2 gap-6 items-start">
+        <Panel title="Sign" lead="Load your key file and sign a message. Nothing leaves this browser.">
+          <Field label="Private key file">
+            <input type="file" accept=".json,application/json" onChange={loadKey}
+              className="block w-full text-[13px] text-muted file:mr-3 file:rounded-lg file:border-0 file:bg-shell-900 file:px-4 file:py-2.5 file:text-[13px] file:font-semibold file:text-white hover:file:bg-shell-700 cursor-pointer" />
+          </Field>
+          <Field label="Message">
+            <textarea className={areaCls} value={msgIn} onChange={e=>setMsgIn(e.target.value)}
+              placeholder="e.g. Transfer approved — Aarthi" />
+          </Field>
+          <Button onClick={sign}>Sign message</Button>
+          {sig && (
+            <div className="mt-5">
+              <Field label="Signature — base64">
+                <textarea readOnly value={sig} className={areaCls} />
+              </Field>
+            </div>
+          )}
+          <Notice tone={note?.tone}>{note?.text}</Notice>
+        </Panel>
+
+        <Panel title="Verify" lead="Fetches the signer's public key from the contract, checks the certificate is still valid, then checks the signature.">
+          <Field label="Signer's certificate number">
+            <input type="number" min="1" className={inputCls} value={vId} onChange={e=>setVId(e.target.value)} placeholder="e.g. 1" />
+          </Field>
+          <Field label="Message">
+            <textarea className={areaCls} value={vMsg} onChange={e=>setVMsg(e.target.value)} />
+          </Field>
+          <Field label="Signature">
+            <textarea className={areaCls} value={vSig} onChange={e=>setVSig(e.target.value)} />
+          </Field>
+          <Button onClick={verify} busy={vBusy}>Verify signature</Button>
+
+          {verdict && (
+            <div className={`mt-6 rounded-xl border ${vTone[verdict.k].border}/40 ${vTone[verdict.k].bg} p-6`}>
+              <p className={`font-serif text-[30px] font-semibold leading-none ${vTone[verdict.k].text}`}>{verdict.title}</p>
+              <p className="text-[13.5px] text-ink mt-2.5">{verdict.body}</p>
+            </div>
+          )}
+        </Panel>
+      </div>
+
+      <div className="mt-2 rounded-xl border border-line bg-white p-6">
+        <h3 className="font-serif text-[17px] font-semibold text-ink">Try this in your demo</h3>
+        <p className="text-[13.5px] text-muted mt-1.5 max-w-[68ch]">
+          Sign a message and verify it — authentic. Change one character of the message and verify
+          again — invalid. Then revoke the certificate and verify the original, untouched signature
+          one more time. It is still cryptographically perfect, and it is still rejected. That is
+          revocation working, and it takes about ninety seconds to show.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ shell ═══════════════ */
+const NAV = [
+  { id:'overview',   label:'Overview' },
+  { id:'keys',       label:'Keys' },
+  { id:'issue',      label:'Issue' },
+  { id:'certs',      label:'Certificates' },
+  { id:'verify',     label:'Verify' },
+  { id:'signatures', label:'Signatures' }
+];
+
+function App(){
+  const { account, chainOk, connect, demo, setDemo } = useChain();
+  const [view,setView]     = useState('overview');
+  const [stashed,setStash] = useState("");
+  const [open,setOpen]     = useState(false);
+  const [err,setErr]       = useState("");
+
+  const go = id => { setView(id); setOpen(false); };
+
+  const doConnect = async () => {
+    setErr("");
+    try { await connect(); } catch(e){ setErr(e.message); }
+  };
+
+  return (
+    <div className="min-h-screen lg:flex">
+      {/* sidebar */}
+      <aside className={`${open?'block':'hidden'} lg:block lg:w-60 shrink-0 bg-shell-900 text-white lg:min-h-screen`}>
+        <div className="px-6 py-6 border-b border-white/8">
+          <div className="flex items-center gap-2.5">
+            <span className="h-7 w-7 rounded-full border-2 border-patina flex items-center justify-center">
+              <span className="h-2.5 w-2.5 rounded-full bg-patina" />
+            </span>
+            <span className="font-serif text-[18px] font-semibold">Certifi</span>
+          </div>
+          <p className="text-[11.5px] text-white/45 mt-2 leading-snug">Decentralized certificate registry</p>
+        </div>
+        <nav className="p-3">
+          {NAV.map(n => (
+            <button key={n.id} onClick={()=>go(n.id)}
+              className={`w-full text-left rounded-lg px-3.5 py-2.5 text-[14px] mb-0.5 transition ${
+                view===n.id ? "bg-white/10 text-white font-semibold" : "text-white/60 hover:text-white hover:bg-white/5"}`}>
+              {n.label}
+            </button>
+          ))}
+        </nav>
+        <div className="px-4 pb-6 mt-2">
+          <label className="flex items-center gap-2.5 text-[12.5px] text-white/55 cursor-pointer">
+            <input type="checkbox" checked={demo} onChange={e=>setDemo(e.target.checked)}
+              className="h-3.5 w-3.5 rounded accent-patina" />
+            Demo mode
+          </label>
+          <p className="text-[11px] text-white/30 mt-1.5 leading-snug">
+            Sample data, no network. Useful if the venue Wi-Fi fails.
+          </p>
+        </div>
+      </aside>
+
+      {/* main */}
+      <div className="flex-1 min-w-0">
+        <header className="sticky top-0 z-30 flex items-center justify-between gap-4 border-b border-line bg-work/90 backdrop-blur px-5 lg:px-9 py-3.5">
+          <button onClick={()=>setOpen(o=>!o)} className="lg:hidden rounded-lg border border-line bg-white px-3 py-2 text-[13px] font-medium">
+            Menu
+          </button>
+          <div className="hidden lg:block text-[13px] text-muted">
+            {CONFIGURED
+              ? <span>Contract <span className="font-mono text-ink">{short(CONTRACT_ADDRESS)}</span> on Sepolia</span>
+              : <span>No contract configured — running on sample data</span>}
+          </div>
+          <div className="flex items-center gap-3">
+            {account ? (
+              <div className="flex items-center gap-2.5 rounded-lg border border-line bg-white px-3.5 py-2">
+                <span className={`h-2 w-2 rounded-full ${chainOk ? 'bg-patina' : 'bg-brass'}`} />
+                <span className="font-mono text-[12.5px] text-ink">{short(account)}</span>
+                <span className="text-[12px] text-muted">{chainOk ? 'Sepolia' : 'Wrong network'}</span>
+              </div>
+            ) : (
+              <Button kind="quiet" onClick={doConnect}>Connect wallet</Button>
+            )}
+          </div>
+        </header>
+
+        {err && <div className="mx-5 lg:mx-9 mt-4 rounded-lg border border-seal/30 bg-seal-light px-4 py-3 text-[13.5px] text-seal">{err}</div>}
+        {account && !chainOk && (
+          <div className="mx-5 lg:mx-9 mt-4 rounded-lg border border-brass/30 bg-brass-light px-4 py-3 text-[13.5px] text-brass">
+            MetaMask is on the wrong network. Switch it to Sepolia to issue or revoke certificates.
+          </div>
+        )}
+
+        <main className="px-5 lg:px-9 py-7 max-w-[1180px]">
+          {view==='overview'   && <Overview go={go} />}
+          {view==='keys'       && <Keys stash={setStash} />}
+          {view==='issue'      && <Issue stashed={stashed} go={go} />}
+          {view==='certs'      && <Certificates />}
+          {view==='verify'     && <Verify />}
+          {view==='signatures' && <Signatures />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root'))
+  .render(<ChainProvider><App /></ChainProvider>);
+</script>
+</body>
+</html>
