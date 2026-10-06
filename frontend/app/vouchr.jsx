@@ -1,0 +1,1276 @@
+"use client";
+
+import { useState, useEffect, useCallback, useMemo, createContext, useContext } from "react";
+import * as ethers from "ethers";
+import Link from "next/link";
+import AttachmentPanel from "../components/AttachmentPanel";
+import { apiFetch, signOut } from "../lib/client-api";
+import { uploadAttachment } from "../lib/attachments-client";
+
+/* ═══════════════════════════════════════════════════════════════════
+   CONFIGURATION — EDIT THIS ONE LINE
+   Paste the address Remix gave you after deploying to Sepolia.
+   Leave it as-is to run in Demo mode with sample data.
+   ═══════════════════════════════════════════════════════════════════ */
+const CONTRACT_ADDRESS = "0x933958160a0fFb81daf4C5F10cabc08bbd1718FF";
+
+const PUBLIC_RPC    = "https://ethereum-sepolia-rpc.publicnode.com";
+const SEPOLIA_CHAIN = 11155111n;
+const SEPOLIA_CHAIN_HEX = "0xaa36a7";
+const CONFIGURED    = !CONTRACT_ADDRESS.startsWith("PASTE");
+
+const ABI = [
+  "function issueCertificate(string subjectName, string publicKey, uint256 validityDays) returns (uint256)",
+  "function revokeCertificate(uint256 id, string reason)",
+  "function verifyCertificate(uint256 id) view returns (bool valid, string status, address owner, string subjectName, string publicKey)",
+  "function getCertificate(uint256 id) view returns (tuple(uint256 id, address owner, string subjectName, string publicKey, bytes32 fingerprint, uint256 issuedAt, uint256 expiresAt, bool revoked, string revocationReason))",
+  "function getCertificatesByOwner(address owner) view returns (uint256[])",
+  "function totalCertificates() view returns (uint256)",
+  "event CertificateIssued(uint256 indexed id, address indexed owner, string subjectName, bytes32 indexed fingerprint, uint256 issuedAt, uint256 expiresAt)"
+];
+
+/* ═══════════════ helpers ═══════════════ */
+const b64  = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64= s   => Uint8Array.from(atob(s.trim()), c => c.charCodeAt(0)).buffer;
+const short= a   => a ? a.slice(0,6) + "…" + a.slice(-4) : "";
+const fmt  = ts  => new Date(Number(ts)*1000).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});
+const nowS = ()  => Math.floor(Date.now()/1000);
+
+function stateOf(c){
+  if (c.revoked) return "revoked";
+  if (Number(c.expiresAt) < nowS()) return "expired";
+  return "valid";
+}
+
+const TONE = {
+  valid:   { label:"Valid",   text:"text-patina", bg:"bg-patina-light", border:"border-patina-border", bar:"bg-patina"  },
+  expired: { label:"Expired", text:"text-brass",  bg:"bg-brass-light",  border:"border-brass-border",  bar:"bg-brass"   },
+  revoked: { label:"Revoked", text:"text-seal",   bg:"bg-seal-light",   border:"border-seal-border",   bar:"bg-seal"    }
+};
+
+/* ═══════════════ demo data ═══════════════ */
+const DEMO_OWNER = "0x7A3f4C1b9D8e2F5a6B0c4D7e1F8a3B2c5D6E9f01";
+const demoSeed = () => ([
+  { id:1n, owner:DEMO_OWNER, subjectName:"Aarthi Raman",  publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7pQ2mKcVn1sXbQzYh0RtL9dGfW3aJ4uC",
+    fingerprint:"0x9c41ab77e2d0f5183ba6c9e4d217f80b3ac5e6d918f2b7c04a5e3d6f1b8c2094",
+    issuedAt:BigInt(nowS()-86400*41), expiresAt:BigInt(nowS()+86400*324), revoked:false, revocationReason:"" },
+  { id:2n, owner:DEMO_OWNER, subjectName:"Salem Node Operator", publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEm2XvR8pL0dYtQ6hN4sB7cF1gA9eJ3kZu",
+    fingerprint:"0x4e72d5c1980ab3f6e2470dc85b19f3a7e6d0c284519bf7a3e0d64c2b85f19730",
+    issuedAt:BigInt(nowS()-86400*180), expiresAt:BigInt(nowS()-86400*4), revoked:false, revocationReason:"" },
+  { id:3n, owner:DEMO_OWNER, subjectName:"Test Mail Relay", publicKey:"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEq7HsT2nW5fX8bK1yE4vC0dR6gM9jP3aL",
+    fingerprint:"0xd81f30a95c6e2b47f09d1538ea7c04b62e93f5a108dc74b6e2f0a95318cd7402",
+    issuedAt:BigInt(nowS()-86400*95), expiresAt:BigInt(nowS()+86400*270), revoked:true, revocationReason:"Private key compromised" }
+]);
+
+/* ═══════════════ chain context ═══════════════ */
+const Chain = createContext(null);
+const useChain = () => useContext(Chain);
+const SessionContext = createContext(null);
+const useAuthSession = () => useContext(SessionContext);
+
+function SessionProvider({ children }) {
+  const [session, setSession] = useState(null);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    apiFetch("/api/auth/session")
+      .then(data => setSession(data.session))
+      .catch(() => setSession(null))
+      .finally(() => setReady(true));
+  }, []);
+  return <SessionContext.Provider value={{ session, ready, setSession }}>
+    {children}
+  </SessionContext.Provider>;
+}
+
+function ChainProvider({children}){
+  const [account,setAccount] = useState(null);
+  const [chainOk,setChainOk] = useState(true);
+  const [demo,setDemo]       = useState(!CONFIGURED);
+  const [demoCerts,setDemoCerts] = useState(demoSeed);
+  const [signer,setSigner]   = useState(null);
+
+  const connect = useCallback(async () => {
+    if (!window.ethereum) throw new Error("MetaMask is not installed in this browser.");
+    const p = new ethers.BrowserProvider(window.ethereum);
+    await p.send("eth_requestAccounts", []);
+    const s = await p.getSigner();
+    const n = await p.getNetwork();
+    setSigner(s); setAccount(await s.getAddress()); setChainOk(n.chainId === SEPOLIA_CHAIN);
+  }, []);
+
+  const switchToSepolia = async () => {
+    if (!window.ethereum) throw new Error("MetaMask is not installed in this browser.");
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_CHAIN_HEX }]
+    });
+  };
+
+  useEffect(() => {
+    const onAccountsChanged = () => location.reload();
+    const onChainChanged = async chainId => {
+      setChainOk(BigInt(chainId) === SEPOLIA_CHAIN);
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        if (!accounts.length) { setSigner(null); setAccount(null); return; }
+        const p = new ethers.BrowserProvider(window.ethereum);
+        const s = await p.getSigner();
+        setSigner(s); setAccount(await s.getAddress());
+      } catch {
+        setSigner(null); setAccount(null);
+      }
+    };
+    window.ethereum?.on?.('accountsChanged', onAccountsChanged);
+    window.ethereum?.on?.('chainChanged', onChainChanged);
+    return () => {
+      window.ethereum?.removeListener?.('accountsChanged', onAccountsChanged);
+      window.ethereum?.removeListener?.('chainChanged', onChainChanged);
+    };
+  }, []);
+
+  const read  = () => new ethers.Contract(CONTRACT_ADDRESS, ABI, new ethers.JsonRpcProvider(PUBLIC_RPC));
+  const write = async () => {
+    if (!signer) throw new Error("Connect your wallet first.");
+    const chainId = await window.ethereum.request({ method: "eth_chainId" });
+    if (BigInt(chainId) !== SEPOLIA_CHAIN) {
+      throw new Error("Switch MetaMask to Sepolia before issuing or revoking certificates.");
+    }
+    return new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+  };
+
+  const api = useMemo(() => ({
+    async list(){
+      if (demo) return demoCerts;
+      const c = read();
+      const ids = await c.getCertificatesByOwner(account);
+      return Promise.all(ids.map(i => c.getCertificate(i)));
+    },
+    async get(id){
+      if (demo) return demoCerts.find(c => c.id === BigInt(id)) || null;
+      try { return await read().getCertificate(id); } catch { return null; }
+    },
+    async issue(name, key, days){
+      if (demo){
+        const id = BigInt(demoCerts.length + 1);
+        const cert = { id, owner:account||DEMO_OWNER, subjectName:name, publicKey:key,
+          fingerprint:"0x"+Array.from({length:64},()=>"0123456789abcdef"[Math.random()*16|0]).join(""),
+          issuedAt:BigInt(nowS()), expiresAt:BigInt(nowS()+days*86400), revoked:false, revocationReason:"" };
+        setDemoCerts(p => [...p, cert]);
+        return { id:id.toString(), hash:null };
+      }
+      const c  = await write();
+      const tx = await c.issueCertificate(name, key, days);
+      const r  = await tx.wait();
+      let id = "?";
+      for (const log of r.logs){
+        try { const p = c.interface.parseLog(log); if (p?.name === "CertificateIssued"){ id = p.args.id.toString(); break; } } catch(_){}
+      }
+      return { id, hash: tx.hash };
+    },
+    async revoke(id, reason){
+      if (demo){
+        setDemoCerts(p => p.map(c => c.id === BigInt(id) ? {...c, revoked:true, revocationReason:reason} : c));
+        return { hash:null };
+      }
+      const tx = await (await write()).revokeCertificate(id, reason);
+      await tx.wait();
+      return { hash: tx.hash };
+    }
+  }), [demo, demoCerts, account, signer]);
+
+  return <Chain.Provider value={{account,chainOk,demo,setDemo,connect,switchToSepolia,api}}>{children}</Chain.Provider>;
+}
+
+/* ═══════════════ SVG Icons ═══════════════ */
+const LogoIcon = () => (
+  <svg width="28" height="28" viewBox="0 0 32 32" fill="none" className="text-ink shrink-0">
+    <path d="M16 3L27 9.35V22.65L16 29L5 22.65V9.35L16 3Z" stroke="currentColor" strokeWidth="2.2" strokeLinejoin="round"/>
+    <path d="M16 3V16M16 16L27 9.35M16 16L5 9.35" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"/>
+    <path d="M16 16V29" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"/>
+    <circle cx="16" cy="3" r="1.8" fill="currentColor"/>
+    <circle cx="27" cy="9.35" r="1.8" fill="currentColor"/>
+    <circle cx="27" cy="22.65" r="1.8" fill="currentColor"/>
+    <circle cx="16" cy="29" r="1.8" fill="currentColor"/>
+    <circle cx="5" cy="22.65" r="1.8" fill="currentColor"/>
+    <circle cx="5" cy="9.35" r="1.8" fill="currentColor"/>
+    <circle cx="16" cy="16" r="1.8" fill="currentColor"/>
+  </svg>
+);
+
+const OverviewIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+    <polyline points="9 22 9 12 15 12 15 22"/>
+  </svg>
+);
+
+const KeysIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="7.5" cy="15.5" r="5.5"/>
+    <path d="M21 2l-9.6 9.6"/>
+    <path d="M15.5 7.5l3 3"/>
+    <path d="M18.5 4.5l3 3"/>
+  </svg>
+);
+
+const IssueIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="12" y1="11" x2="12" y2="17"/>
+    <line x1="9" y1="14" x2="15" y2="14"/>
+  </svg>
+);
+
+const CertsIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+    <polyline points="14 2 14 8 20 8"/>
+    <line x1="8" y1="13" x2="16" y2="13"/>
+    <line x1="8" y1="17" x2="14" y2="17"/>
+  </svg>
+);
+
+const VerifyIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+  </svg>
+);
+
+const SignaturesIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 19l7-7 3 3-7 7-3-3z"/>
+    <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
+    <path d="M2 2l7.586 7.586"/>
+    <circle cx="11" cy="11" r="2"/>
+  </svg>
+);
+
+const NavIconsMap = {
+  overview: OverviewIcon,
+  keys: KeysIcon,
+  issue: IssueIcon,
+  certs: CertsIcon,
+  verify: VerifyIcon,
+  signatures: SignaturesIcon
+};
+
+const ExternalLinkIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+    <polyline points="15 3 21 3 21 9"/>
+    <line x1="10" y1="14" x2="21" y2="3"/>
+  </svg>
+);
+
+const WalletIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/>
+    <path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/>
+    <path d="M18 12a2 2 0 0 0-2 2c0 1.1.9 2 2 2h4v-4h-4z"/>
+  </svg>
+);
+
+const EthDiamondIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M11.999 2L4.5 14.372L12 18.777L19.5 14.372L11.999 2ZM11.999 20.306L4.5 15.656L12 26L19.5 15.656L11.999 20.306Z"/>
+  </svg>
+);
+
+const OverviewHeaderIllustration = () => (
+  <svg width="340" height="150" viewBox="0 0 340 150" fill="none" className="w-full max-w-[340px] h-auto overflow-visible">
+    {/* Soft blob */}
+    <path d="M140 20C210 5 310 15 330 65C350 115 280 145 200 140C120 135 110 110 90 90C70 70 70 35 140 20Z" fill="#D8C7F8" fillOpacity="0.85"/>
+
+    {/* Sparkle stars */}
+    <path d="M70 20L72 26L78 28L72 30L70 36L68 30L62 28L68 26Z" fill="#1E102A"/>
+    <path d="M278 15L279.5 19.5L284 21L279.5 22.5L278 27L276.5 22.5L272 21L276.5 19.5Z" fill="#1E102A"/>
+    <path d="M285 130L286.5 134.5L291 136L286.5 137.5L285 142L283.5 137.5L279 136L283.5 134.5Z" fill="#1E102A"/>
+    <text x="60" y="98" fill="#1E102A" fontSize="16" fontWeight="bold">+</text>
+
+    {/* Certificate document */}
+    <g transform="translate(130, 22) rotate(-6)">
+      <rect x="0" y="0" width="76" height="96" rx="4" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2.2"/>
+      <line x1="12" y1="16" x2="52" y2="16" stroke="#1E102A" strokeWidth="2.5" strokeLinecap="round"/>
+      <line x1="12" y1="28" x2="64" y2="28" stroke="#1E102A" strokeWidth="1.8" strokeLinecap="round"/>
+      <line x1="12" y1="38" x2="64" y2="38" stroke="#1E102A" strokeWidth="1.8" strokeLinecap="round"/>
+      <line x1="12" y1="48" x2="54" y2="48" stroke="#1E102A" strokeWidth="1.8" strokeLinecap="round"/>
+
+      {/* Ribbon seal */}
+      <circle cx="50" cy="70" r="11" fill="#2D193E"/>
+      <circle cx="50" cy="70" r="8" stroke="#FAF7F2" strokeWidth="1.5"/>
+      <path d="M46 79L43 92L50 87L57 92L54 79" fill="#2D193E" stroke="#1E102A" strokeWidth="1"/>
+    </g>
+
+    {/* Connection lines */}
+    <path d="M210 50 L242 42" stroke="#1E102A" strokeWidth="1.8" strokeDasharray="3 3"/>
+    <path d="M215 78 L265 80" stroke="#1E102A" strokeWidth="1.8" strokeDasharray="3 3"/>
+
+    {/* Isometric Cube 1 */}
+    <g transform="translate(245, 25)">
+      <path d="M18 0L36 9L18 18L0 9Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2"/>
+      <path d="M0 9V27L18 36V18Z" fill="#2D193E" stroke="#1E102A" strokeWidth="2"/>
+      <path d="M18 18V36L36 27V9Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2"/>
+      <line x1="22" y1="18" x2="32" y2="13" stroke="#1E102A" strokeWidth="1"/>
+      <line x1="22" y1="24" x2="32" y2="19" stroke="#1E102A" strokeWidth="1"/>
+      <line x1="22" y1="30" x2="32" y2="25" stroke="#1E102A" strokeWidth="1"/>
+    </g>
+
+    {/* Isometric Cube 2 */}
+    <g transform="translate(268, 75)">
+      <path d="M18 0L36 9L18 18L0 9Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2"/>
+      <path d="M0 9V27L18 36V18Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2"/>
+      <path d="M18 18V36L36 27V9Z" fill="#2D193E" stroke="#1E102A" strokeWidth="2"/>
+      <line x1="4" y1="12" x2="14" y2="17" stroke="#1E102A" strokeWidth="1"/>
+      <line x1="4" y1="18" x2="14" y2="23" stroke="#1E102A" strokeWidth="1"/>
+      <line x1="4" y1="24" x2="14" y2="29" stroke="#1E102A" strokeWidth="1"/>
+    </g>
+
+    {/* Hand-drawn arrow & Text */}
+    <g transform="translate(295, 2)">
+      <text x="5" y="15" fill="#1E102A" fontFamily="Caveat, cursive" fontSize="17" fontWeight="bold" transform="rotate(8)">YOUR TRUST</text>
+      <text x="12" y="30" fill="#1E102A" fontFamily="Caveat, cursive" fontSize="17" fontWeight="bold" transform="rotate(8)">ON CHAIN</text>
+      <path d="M22 36 C18 48 10 52 14 62" stroke="#1E102A" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
+      <path d="M9 57 L14 63 L19 55" stroke="#1E102A" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
+    </g>
+  </svg>
+);
+
+const EmptyCrateIllustration = () => (
+  <svg width="150" height="130" viewBox="0 0 150 130" fill="none" className="w-full max-w-[150px] h-auto overflow-visible">
+    {/* Radiating lines */}
+    <line x1="25" y1="40" x2="12" y2="28" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+    <line x1="38" y1="26" x2="32" y2="10" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+    <line x1="56" y1="20" x2="56" y2="4" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+    <line x1="74" y1="26" x2="80" y2="10" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+    <line x1="86" y1="40" x2="98" y2="28" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+
+    {/* Sparkles */}
+    <path d="M12 80L13.5 83.5L17 85L13.5 86.5L12 90L10.5 86.5L7 85L10.5 83.5Z" fill="#1E102A"/>
+    <path d="M135 60L136.5 63.5L140 65L136.5 66.5L135 70L133.5 66.5L130 65L133.5 63.5Z" fill="#1E102A"/>
+
+    {/* Paper popping out */}
+    <g transform="translate(42, 28) rotate(-4)">
+      <rect x="0" y="0" width="56" height="70" rx="3" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2"/>
+      <line x1="10" y1="14" x2="40" y2="14" stroke="#1E102A" strokeWidth="2" strokeLinecap="round"/>
+      <line x1="10" y1="24" x2="46" y2="24" stroke="#1E102A" strokeWidth="1.5" strokeLinecap="round"/>
+      <line x1="10" y1="32" x2="46" y2="32" stroke="#1E102A" strokeWidth="1.5" strokeLinecap="round"/>
+      <line x1="10" y1="40" x2="36" y2="40" stroke="#1E102A" strokeWidth="1.5" strokeLinecap="round"/>
+    </g>
+
+    {/* Cardboard Box */}
+    <path d="M30 65 L75 88 L120 65 L75 42 Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2.2" strokeLinejoin="round"/>
+    <path d="M30 65 V105 L75 125 V88 Z" fill="#E4DAF8" stroke="#1E102A" strokeWidth="2.2" strokeLinejoin="round"/>
+    <path d="M120 65 V105 L75 125 V88 Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2.2" strokeLinejoin="round"/>
+
+    {/* Flaps */}
+    <path d="M30 65 L15 50 L58 35 L75 42 Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2" strokeLinejoin="round"/>
+    <path d="M120 65 L135 50 L92 35 L75 42 Z" fill="#FAF7F2" stroke="#1E102A" strokeWidth="2" strokeLinejoin="round"/>
+
+    {/* Hatching texture on left box wall */}
+    <line x1="38" y1="75" x2="48" y2="80" stroke="#1E102A" strokeWidth="1"/>
+    <line x1="38" y1="85" x2="48" y2="90" stroke="#1E102A" strokeWidth="1"/>
+    <line x1="38" y1="95" x2="48" y2="100" stroke="#1E102A" strokeWidth="1"/>
+  </svg>
+);
+
+const BottomArrowIllustration = () => (
+  <svg width="120" height="60" viewBox="0 0 120 60" fill="none" className="overflow-visible">
+    <text x="35" y="48" fill="#1E102A" fontFamily="Caveat, cursive" fontSize="18" fontWeight="bold" transform="rotate(-6)">CONNECT</text>
+    <text x="40" y="62" fill="#1E102A" fontFamily="Caveat, cursive" fontSize="18" fontWeight="bold" transform="rotate(-6)">TO BEGIN</text>
+    <path d="M25 45 C15 35 15 15 30 10" stroke="#1E102A" strokeWidth="2" fill="none" strokeLinecap="round"/>
+    <path d="M22 6 L31 9 L28 18" stroke="#1E102A" strokeWidth="2" fill="none" strokeLinecap="round"/>
+  </svg>
+);
+
+/* ═══════════════ Primitives ═══════════════ */
+function Field({label, hint, children}){
+  return (
+    <div className="mb-5">
+      <label className="block text-[13.5px] font-semibold text-ink mb-1.5">{label}</label>
+      {children}
+      {hint && <p className="text-[12px] text-muted mt-1.5 max-w-[58ch] leading-normal">{hint}</p>}
+    </div>
+  );
+}
+const inputCls = "w-full rounded-xl border border-line bg-white px-4 py-2.5 text-[14px] text-ink placeholder:text-muted/60 focus:border-ink focus:outline-none focus:ring-2 focus:ring-ink/10 transition";
+const areaCls  = inputCls + " font-mono text-[12px] leading-relaxed min-h-[88px] resize-y";
+
+function Button({children, kind="primary", busy, ...rest}){
+  const styles = {
+    primary: "bg-shell-900 text-white hover:bg-shell-800 shadow-sm",
+    success: "bg-patina text-white hover:bg-patina-dark shadow-sm",
+    quiet:   "bg-white text-ink border border-line hover:border-ink/40 shadow-sm",
+    danger:  "bg-seal text-white hover:brightness-110 shadow-sm"
+  }[kind];
+  return (
+    <button {...rest} disabled={busy || rest.disabled}
+      className={`inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-[14px] font-semibold transition active:scale-[0.98] disabled:opacity-45 disabled:cursor-not-allowed ${styles}`}>
+      {busy && <span className="h-3.5 w-3.5 rounded-full border-2 border-current border-t-transparent animate-spin" />}
+      {children}
+    </button>
+  );
+}
+
+function Notice({tone, children}){
+  if (!children) return null;
+  const map = {
+    ok:   "bg-patina-light text-patina-dark border-patina-border",
+    warn: "bg-brass-light text-brass border-brass-border",
+    bad:  "bg-seal-light text-seal border-seal-border",
+    info: "bg-white text-muted border-line"
+  };
+  return <div className={`mt-5 rounded-xl border px-4 py-3 text-[13.5px] break-words ${map[tone||'info']}`}>{children}</div>;
+}
+
+function Panel({title, lead, children, aside}){
+  return (
+    <section className="rounded-2xl border border-line bg-card p-6 md:p-7 mb-6 shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-6">
+        <div>
+          <h2 className="text-[20px] font-bold text-ink leading-tight">{title}</h2>
+          {lead && <p className="text-[14px] text-muted mt-1 max-w-[62ch]">{lead}</p>}
+        </div>
+        {aside}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/* ═══════════════ Certificate Document Component ═══════════════ */
+function Seal({state, size=64}){
+  const t = TONE[state];
+  return (
+    <div className={`stamp shrink-0 rounded-full border-2 ${t.border} ${t.bg} flex items-center justify-center shadow-sm`}
+         style={{width:size, height:size}}>
+      <div className={`rounded-full border ${t.border} flex items-center justify-center`}
+           style={{width:size-10, height:size-10}}>
+        <span className={`font-bold leading-none uppercase tracking-wider ${t.text}`} style={{fontSize:size*0.17}}>
+          {t.label}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function CertificateDoc({cert, onRevoke, compact}){
+  const st = stateOf(cert), t = TONE[st];
+  return (
+    <article className={`relative overflow-hidden rounded-2xl border ${t.border} bg-white shadow-sm transition hover:shadow-md`}>
+      <div className={`absolute inset-x-0 top-0 h-1.5 ${t.bar}`} />
+      <div className="guilloche absolute inset-0 pointer-events-none opacity-60" />
+      <div className="relative p-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-[12px] font-medium text-muted uppercase tracking-wider">Certificate No. {cert.id.toString()}</p>
+            <h3 className="text-[22px] font-bold text-ink leading-tight mt-1 truncate">
+              {cert.subjectName}
+            </h3>
+            <p className="font-mono text-[11.5px] text-muted mt-1 truncate">{cert.owner}</p>
+          </div>
+          <Seal state={st} size={compact ? 54 : 64} />
+        </div>
+
+        <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-line pt-4 text-[13px]">
+          <div><dt className="text-muted text-[11.5px] font-medium uppercase tracking-wider">Issued</dt><dd className="text-ink font-medium mt-0.5">{fmt(cert.issuedAt)}</dd></div>
+          <div><dt className="text-muted text-[11.5px] font-medium uppercase tracking-wider">Expires</dt><dd className="text-ink font-medium mt-0.5">{fmt(cert.expiresAt)}</dd></div>
+          <div className="col-span-2">
+            <dt className="text-muted text-[11.5px] font-medium uppercase tracking-wider">Key fingerprint</dt>
+            <dd className="font-mono text-[11.5px] text-ink break-all mt-0.5 bg-card/60 p-2 rounded-lg border border-line">{cert.fingerprint}</dd>
+          </div>
+          {cert.revoked && (
+            <div className="col-span-2">
+              <dt className="text-muted text-[11.5px] font-medium uppercase tracking-wider">Revocation reason</dt>
+              <dd className="text-seal font-medium mt-0.5">{cert.revocationReason || "Not specified"}</dd>
+            </div>
+          )}
+        </div>
+
+        {onRevoke && st === "valid" && (
+          <div className="mt-5 border-t border-line pt-4">
+            <button onClick={() => onRevoke(cert)}
+              className="text-[13px] font-semibold text-seal hover:underline inline-flex items-center gap-1">
+              Revoke this certificate
+            </button>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
+/* ═══════════════ 1. Overview ═══════════════ */
+function Overview({go}){
+  const { api, account, demo } = useChain();
+  const [certs,setCerts] = useState([]);
+  const [loading,setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try { setCerts(await api.list()); } catch { setCerts([]); }
+      setLoading(false);
+    })();
+  }, [api, account]);
+
+  const counts = certs.reduce((a,c) => { a[stateOf(c)]++; return a; }, {valid:0,expired:0,revoked:0});
+
+  return (
+    <div className="space-y-6">
+      {/* Header section matching exact reference UI */}
+      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 pb-2">
+        <div className="max-w-[560px]">
+          <h1 className="text-[36px] font-extrabold text-ink tracking-tight leading-none">Registry overview</h1>
+          <p className="text-[14.5px] text-muted mt-3 leading-relaxed">
+            Certificates issued by your address, read directly from the smart contract.
+            No authority approves, mediates or can alter any of them.
+          </p>
+        </div>
+        <div className="hidden sm:block shrink-0">
+          <OverviewHeaderIllustration />
+        </div>
+      </div>
+
+      {/* Middle Empty State / Hero Box */}
+      {loading ? (
+        <div className="h-48 rounded-2xl border border-line bg-white animate-pulse" />
+      ) : certs.length > 0 ? (
+        <div className="grid md:grid-cols-2 gap-5">
+          {certs.slice(0, 2).map(c => <CertificateDoc key={c.id.toString()} cert={c} />)}
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-line bg-lilac/70 p-8 md:p-10 flex flex-col md:flex-row items-center gap-8 shadow-sm">
+          <div className="shrink-0">
+            <EmptyCrateIllustration />
+          </div>
+          <div className="flex-1 text-center md:text-left">
+            <h3 className="text-[24px] font-extrabold text-ink tracking-tight">No certificates yet</h3>
+            <p className="text-[14.5px] text-muted mt-2 mb-6 max-w-[44ch]">
+              Generate a key pair, then issue your first certificate. It takes about a minute.
+            </p>
+            <button onClick={() => go('keys')}
+              className="inline-flex items-center gap-2.5 rounded-2xl bg-shell-900 hover:bg-shell-800 text-white px-6 py-3 text-[14.5px] font-bold transition shadow-sm">
+              <KeysIcon />
+              <span>Generate a key pair</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Stats Cards Grid (3 Columns) */}
+      <div className="grid sm:grid-cols-3 gap-5">
+        {/* Valid Card */}
+        <div className="rounded-2xl border border-patina-border bg-patina-light p-6 flex items-start justify-between shadow-sm">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-patina" />
+              <span className="text-[14px] font-bold text-patina">Valid</span>
+            </div>
+            <p className="text-[44px] font-black text-ink mt-2 leading-none">{counts.valid}</p>
+            <p className="text-[13px] text-muted mt-3">Active and unrevoked certificates</p>
+          </div>
+          <div className="p-3 bg-white/80 rounded-xl border border-patina-border/60 text-patina">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <circle cx="11" cy="14" r="3"/>
+              <path d="M10 14l1 1 2-2"/>
+            </svg>
+          </div>
+        </div>
+
+        {/* Expired Card */}
+        <div className="rounded-2xl border border-brass-border bg-brass-light p-6 flex items-start justify-between shadow-sm">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-brass" />
+              <span className="text-[14px] font-bold text-brass">Expired</span>
+            </div>
+            <p className="text-[44px] font-black text-ink mt-2 leading-none">{counts.expired}</p>
+            <p className="text-[13px] text-muted mt-3">Certificates past their validity date</p>
+          </div>
+          <div className="p-3 bg-white/80 rounded-xl border border-brass-border/60 text-brass">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="9"/>
+              <polyline points="12 7 12 12 15 15"/>
+            </svg>
+          </div>
+        </div>
+
+        {/* Revoked Card */}
+        <div className="rounded-2xl border border-seal-border bg-seal-light p-6 flex items-start justify-between shadow-sm">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-seal" />
+              <span className="text-[14px] font-bold text-seal">Revoked</span>
+            </div>
+            <p className="text-[44px] font-black text-ink mt-2 leading-none">{counts.revoked}</p>
+            <p className="text-[13px] text-muted mt-3">Certificates that have been revoked</p>
+          </div>
+          <div className="p-3 bg-white/80 rounded-xl border border-seal-border/60 text-seal">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <line x1="9" y1="12" x2="15" y2="18"/>
+              <line x1="15" y1="12" x2="9" y2="18"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom Banner with Arrow */}
+      <div className="relative overflow-hidden rounded-2xl border border-line bg-lilac/60 p-5 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-sm">
+        <div className="flex items-center gap-3">
+          <span className="text-[20px] text-ink shrink-0">✦</span>
+          <p className="text-[14px] font-medium text-ink">
+            Get started by connecting your wallet and generating a key pair.
+          </p>
+        </div>
+        <div className="hidden md:block shrink-0 pr-4">
+          <BottomArrowIllustration />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ 2. Keys ═══════════════ */
+function Keys({stash}){
+  const [pair,setPair] = useState(null);
+  const [pub,setPub]   = useState("");
+  const [msg,setMsg]   = useState(null);
+
+  const gen = async () => {
+    try{
+      const kp = await crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"}, true, ["sign","verify"]);
+      const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
+      setPair(kp); setPub(b64(spki)); stash(b64(spki));
+      setMsg({tone:"ok", text:"Key pair created in this browser. Download the private key before you leave this page."});
+    }catch(e){ setMsg({tone:"bad", text:"Could not generate keys: "+e.message}); }
+  };
+
+  const download = async () => {
+    const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(jwk,null,2)],{type:"application/json"}));
+    a.download = "private-key.json"; a.click(); URL.revokeObjectURL(a.href);
+    setMsg({tone:"ok", text:"Private key saved to your downloads. It was never transmitted anywhere."});
+  };
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-[32px] font-extrabold text-ink tracking-tight">Key generation</h1>
+      <Panel title="Create a key pair"
+        lead="Your browser generates an ECDSA P-256 key pair using the built-in Web Crypto API. The private key stays on your machine; only the public key is published to the blockchain.">
+        <div className="flex flex-wrap gap-3">
+          <Button onClick={gen}>Generate key pair</Button>
+          <Button kind="quiet" onClick={download} disabled={!pair}>Download private key</Button>
+        </div>
+
+        {pub && (
+          <div className="mt-6">
+            <Field label="Public key — base64 SPKI"
+              hint="This is safe to share publicly. It has been copied into the Issue form for you.">
+              <textarea readOnly value={pub} className={areaCls} />
+            </Field>
+          </div>
+        )}
+
+        <Notice tone={msg?.tone}>{msg?.text}</Notice>
+
+        <div className="mt-6 rounded-xl border border-brass-border bg-brass-light p-4">
+          <p className="text-[13.5px] text-brass leading-relaxed">
+            Keep <span className="font-mono font-bold">private-key.json</span> somewhere safe. You need it to sign messages.
+            If it is ever exposed, that is precisely when you revoke the certificate.
+          </p>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ═══════════════ 3. Issue ═══════════════ */
+function Issue({stashed, go}){
+  const { api, demo, account, chainOk } = useChain();
+  const { session } = useAuthSession();
+  const [name,setName] = useState("");
+  const [key,setKey]   = useState(stashed || "");
+  const [days,setDays] = useState(365);
+  const [file,setFile] = useState(null);
+  const [pendingUpload,setPendingUpload] = useState(null);
+  const [busy,setBusy] = useState(false);
+  const [msg,setMsg]   = useState(null);
+
+  useEffect(() => { if (stashed) setKey(stashed); }, [stashed]);
+
+  const submit = async () => {
+    if (!name.trim())  return setMsg({tone:"warn", text:"Enter a subject name."});
+    if (!key.trim())   return setMsg({tone:"warn", text:"Generate or paste a public key."});
+    if (!(days>=1 && days<=3650)) return setMsg({tone:"warn", text:"Validity must be between 1 and 3650 days."});
+    if (demo && file) return setMsg({tone:"warn", text:"Turn off demo mode to attach a private file."});
+    if (!demo && !account) return setMsg({tone:"warn", text:"Connect your wallet before issuing."});
+    if (!demo && !chainOk) return setMsg({tone:"warn", text:"Switch MetaMask to Sepolia before issuing."});
+    if (!demo && !session) return setMsg({tone:"warn", text:<span><Link href="/login" className="underline">Sign in</Link> before issuing.</span>});
+    if (!demo && session.role !== "user") return setMsg({tone:"warn", text:"Sign in with a user account to issue certificates."});
+    if (!demo && session.address !== account.toLowerCase()) return setMsg({tone:"warn", text:"Sign in with the connected wallet before issuing."});
+
+    setBusy(true); setMsg({tone:"info", text:"Confirm the transaction in MetaMask…"});
+    try{
+      if (file) await apiFetch("/api/crypto/keys");
+      const r = await api.issue(name.trim(), key.trim(), Number(days));
+      if (file && r.hash) {
+        try {
+          setMsg({tone:"info", text:"Certificate issued. Encrypting and uploading the private file…"});
+          await uploadAttachment(r.id, file);
+          setFile(null);
+        } catch (uploadError) {
+          setPendingUpload({ certId: r.id, file });
+          setMsg({tone:"warn", text:`Certificate No. ${r.id} was issued, but its file was not attached: ${uploadError.message}. Retry below or attach it from Certificates.`});
+          setName(""); setBusy(false); return;
+        }
+      }
+      setMsg({tone:"ok", text:<span>
+        Certificate <strong>No. {r.id}</strong> issued{file && r.hash ? " with an encrypted attachment" : ""}.{" "}
+        {r.hash
+          ? <a className="underline font-semibold" target="_blank" rel="noopener" href={`https://sepolia.etherscan.io/tx/${r.hash}`}>View transaction on Etherscan</a>
+          : "Open Certificates to see it."}
+      </span>});
+      setName("");
+    }catch(e){ setMsg({tone:"bad", text:"Issue failed: " + (e.reason || e.shortMessage || e.message)}); }
+    setBusy(false);
+  };
+
+  const retryUpload = async () => {
+    if (!pendingUpload) return;
+    setBusy(true);
+    try {
+      await uploadAttachment(pendingUpload.certId, pendingUpload.file);
+      setMsg({tone:"ok", text:`Private file attached to certificate No. ${pendingUpload.certId}.`});
+      setPendingUpload(null); setFile(null);
+    } catch (error) { setMsg({tone:"bad", text:error.message}); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-[32px] font-extrabold text-ink tracking-tight">Issue a certificate</h1>
+      <div className="grid lg:grid-cols-[1.3fr_1fr] gap-6 items-start">
+        <Panel title="Certificate details"
+          lead="You are both the issuer and the owner. No authority signs off on this — the contract accepts it because the transaction came from your address.">
+          <Field label="Subject name" hint="The identity this certificate attests to.">
+            <input className={inputCls} value={name} maxLength={128}
+              onChange={e=>setName(e.target.value)} placeholder="e.g. Aarthi Raman" />
+          </Field>
+          <Field label="Public key" hint="Generated on the Keys page, or pasted from elsewhere.">
+            <textarea className={areaCls} value={key} onChange={e=>setKey(e.target.value)}
+              placeholder="Base64 SPKI public key" />
+          </Field>
+          <Field label="Valid for" hint="Between 1 and 3650 days. The contract computes the expiry from the block timestamp.">
+            <div className="flex items-center gap-3">
+              <input type="number" min="1" max="3650" className={inputCls + " max-w-[140px]"}
+                value={days} onChange={e=>setDays(e.target.value)} />
+              <span className="text-[14px] font-medium text-muted">days</span>
+            </div>
+          </Field>
+          <Field label="Private document (optional)" hint="PDF, JPEG, or PNG up to 3 MB. The file is encrypted in your browser and never put on-chain. Use demo documents only in this version.">
+            <input type="file" accept=".pdf,.jpg,.jpeg,.png" onChange={e=>setFile(e.target.files?.[0] || null)}
+              className="block w-full rounded-xl border border-line bg-white p-3 text-sm" />
+          </Field>
+          <Button onClick={submit} busy={busy}>Issue certificate</Button>
+          {pendingUpload && <button onClick={retryUpload} disabled={busy}
+            className="mt-3 rounded-xl border border-brass-border px-4 py-2 font-bold text-brass disabled:opacity-50">
+            Retry attachment upload for No. {pendingUpload.certId}
+          </button>}
+          <Notice tone={msg?.tone}>{msg?.text}</Notice>
+        </Panel>
+
+        <div className="rounded-2xl border border-line bg-card p-6 shadow-sm">
+          <h3 className="text-[18px] font-bold text-ink">Preview</h3>
+          <p className="text-[13px] text-muted mt-1 mb-5">How this will look once it is on chain.</p>
+          <CertificateDoc compact cert={{
+            id: 0n, owner: account || DEMO_OWNER,
+            subjectName: name || "Subject name",
+            publicKey: key,
+            fingerprint: key ? "Computed on chain as keccak256 of public key" : "Awaiting a public key",
+            issuedAt: BigInt(nowS()),
+            expiresAt: BigInt(nowS() + (Number(days)||0)*86400),
+            revoked: false, revocationReason: ""
+          }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ 4. Certificates ═══════════════ */
+function Certificates(){
+  const { api, account, demo } = useChain();
+  const { session } = useAuthSession();
+  const [certs,setCerts]     = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [filter,setFilter]   = useState("all");
+  const [target,setTarget]   = useState(null);
+  const [reason,setReason]   = useState("Private key compromised");
+  const [busy,setBusy]       = useState(false);
+  const [msg,setMsg]         = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setCerts(await api.list()); } catch(e){ setMsg({tone:"bad", text:"Could not load: "+(e.shortMessage||e.message)}); }
+    setLoading(false);
+  }, [api]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const shown = certs.filter(c => filter === "all" || stateOf(c) === filter);
+
+  const doRevoke = async () => {
+    setBusy(true);
+    try{
+      const r = await api.revoke(target.id, reason || "Not specified");
+      setMsg({tone:"ok", text:<span>
+        Certificate No. {target.id.toString()} revoked. Every verification from now on reports it as revoked.{" "}
+        {r.hash && <a className="underline font-semibold" target="_blank" rel="noopener" href={`https://sepolia.etherscan.io/tx/${r.hash}`}>Transaction</a>}
+      </span>});
+      setTarget(null); load();
+    }catch(e){ setMsg({tone:"bad", text:"Revocation failed: " + (e.reason||e.shortMessage||e.message)}); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-[32px] font-extrabold text-ink tracking-tight">Certificates</h1>
+          <p className="text-[14.5px] text-muted mt-1">
+            {demo ? "Sample registry" : account ? `Issued by ${short(account)}` : "Connect a wallet to see your certificates"}
+          </p>
+        </div>
+        <div className="flex gap-1 rounded-xl border border-line bg-white p-1 shadow-sm">
+          {["all","valid","expired","revoked"].map(f => (
+            <button key={f} onClick={()=>setFilter(f)}
+              className={`rounded-lg px-3.5 py-1.5 text-[13px] font-semibold capitalize transition ${
+                filter===f ? "bg-shell-900 text-white shadow-sm" : "text-muted hover:text-ink"}`}>
+              {f}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <Notice tone={msg?.tone}>{msg?.text}</Notice>
+
+      {loading ? (
+        <div className="grid md:grid-cols-2 gap-5 mt-5">
+          {[0,1].map(i => <div key={i} className="h-60 rounded-2xl border border-line bg-white animate-pulse" />)}
+        </div>
+      ) : shown.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-line bg-card p-12 text-center mt-5">
+          <h3 className="text-[20px] font-bold text-ink">Nothing here</h3>
+          <p className="text-[14px] text-muted mt-1.5">
+            {filter === "all" ? "Issue a certificate to get started." : `No ${filter} certificates.`}
+          </p>
+        </div>
+      ) : (
+        <div className="grid md:grid-cols-2 gap-5 mt-5">
+          {shown.map(c => <div key={c.id.toString()}>
+            <CertificateDoc cert={c} onRevoke={setTarget} />
+            {!demo && <AttachmentPanel certId={c.id.toString()} owner={c.owner} session={session} />}
+          </div>)}
+        </div>
+      )}
+
+      {/* Revoke confirmation modal */}
+      {target && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-shell-900/60 backdrop-blur-sm p-4" onClick={()=>!busy&&setTarget(null)}>
+          <div className="w-full max-w-md rounded-2xl bg-card border border-line p-6 shadow-2xl" onClick={e=>e.stopPropagation()}>
+            <h3 className="text-[20px] font-bold text-ink">Revoke certificate No. {target.id.toString()}?</h3>
+            <p className="text-[13.5px] text-muted mt-2 leading-relaxed">
+              Revocation is permanent. The contract has no way to reverse it, deliberately — an
+              un-revoke function would let an attacker restore a compromised certificate.
+            </p>
+            <div className="mt-5">
+              <Field label="Reason">
+                <input className={inputCls} value={reason} onChange={e=>setReason(e.target.value)} />
+              </Field>
+            </div>
+            <div className="flex gap-3">
+              <Button kind="danger" onClick={doRevoke} busy={busy}>Revoke permanently</Button>
+              <Button kind="quiet" onClick={()=>setTarget(null)} disabled={busy}>Cancel</Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════ 5. Verify ═══════════════ */
+function Verify(){
+  const { api } = useChain();
+  const [id,setId]     = useState("");
+  const [busy,setBusy] = useState(false);
+  const [res,setRes]   = useState(undefined);
+
+  const check = async () => {
+    if (!id) return;
+    setBusy(true); setRes(undefined);
+    try { setRes(await api.get(id)); } catch { setRes(null); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-[32px] font-extrabold text-ink tracking-tight">Verify a certificate</h1>
+        <p className="text-[14.5px] text-muted mt-1 max-w-[62ch]">
+          Anyone can run this check — no wallet, no account, no permission. It reads a public
+          blockchain and costs nothing, because verification is a view function.
+        </p>
+      </div>
+
+      <Panel title="Look up by certificate number">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="flex-1 min-w-[200px]">
+            <Field label="Certificate number">
+              <input type="number" min="1" className={inputCls} value={id}
+                onChange={e=>setId(e.target.value)} onKeyDown={e=>e.key==='Enter'&&check()} placeholder="e.g. 1" />
+            </Field>
+          </div>
+          <div className="mb-5"><Button onClick={check} busy={busy}>Check status</Button></div>
+        </div>
+
+        {res === null && (
+          <div className="rounded-2xl border border-line bg-card p-8 text-center mt-4">
+            <p className="text-[24px] font-bold text-muted">Not found</p>
+            <p className="text-[13.5px] text-muted mt-1">No certificate with that number exists in this registry.</p>
+          </div>
+        )}
+
+        {res && (
+          <div className="mt-6 space-y-5">
+            <div className={`rounded-2xl border ${TONE[stateOf(res)].border} ${TONE[stateOf(res)].bg} p-6 flex items-center gap-6 shadow-sm`}>
+              <Seal state={stateOf(res)} size={80} />
+              <div className="min-w-0">
+                <p className={`text-[32px] font-black leading-none uppercase tracking-wide ${TONE[stateOf(res)].text}`}>
+                  {TONE[stateOf(res)].label}
+                </p>
+                <p className="text-[14px] font-medium text-ink mt-2">
+                  {stateOf(res)==="valid"   && "This certificate is active and can be trusted."}
+                  {stateOf(res)==="expired" && "The validity period has ended. Signatures made with this key should no longer be accepted."}
+                  {stateOf(res)==="revoked" && "The owner revoked this certificate. Do not trust anything signed with this key."}
+                </p>
+              </div>
+            </div>
+            <CertificateDoc cert={res} />
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/* ═══════════════ 6. Signatures ═══════════════ */
+function Signatures(){
+  const { api } = useChain();
+  const [priv,setPriv]   = useState(null);
+  const [msgIn,setMsgIn] = useState("");
+  const [sig,setSig]     = useState("");
+  const [note,setNote]   = useState(null);
+
+  const [vId,setVId]   = useState("");
+  const [vMsg,setVMsg] = useState("");
+  const [vSig,setVSig] = useState("");
+  const [vBusy,setVBusy] = useState(false);
+  const [verdict,setVerdict] = useState(null);
+
+  const loadKey = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try{
+      const jwk = JSON.parse(await f.text());
+      setPriv(await crypto.subtle.importKey("jwk", jwk, {name:"ECDSA",namedCurve:"P-256"}, false, ["sign"]));
+      setNote({tone:"ok", text:"Private key loaded into this browser session only."});
+    }catch(err){ setPriv(null); setNote({tone:"bad", text:"That file is not a valid private key: "+err.message}); }
+  };
+
+  const sign = async () => {
+    if (!priv)  return setNote({tone:"warn", text:"Load your private key file first."});
+    if (!msgIn) return setNote({tone:"warn", text:"Enter a message to sign."});
+    const s = await crypto.subtle.sign({name:"ECDSA",hash:"SHA-256"}, priv, new TextEncoder().encode(msgIn));
+    const enc = b64(s);
+    setSig(enc); setVSig(enc); setVMsg(msgIn);
+    setNote({tone:"ok", text:"Message signed. The signature and message have been copied into the verifier."});
+  };
+
+  const verify = async () => {
+    if (!vId || !vMsg || !vSig) return setVerdict({k:"warn", title:"Incomplete", body:"Fill in certificate number, message and signature."});
+    setVBusy(true); setVerdict(null);
+    try{
+      const cert = await api.get(vId);
+      if (!cert) { setVBusy(false); return setVerdict({k:"bad", title:"Rejected", body:"No certificate with that number exists."}); }
+      const st = stateOf(cert);
+      if (st !== "valid"){
+        setVBusy(false);
+        return setVerdict({k:"bad", title:"Rejected", body:`The signature may be mathematically correct, but certificate No. ${vId} is ${TONE[st].label.toLowerCase()}. It cannot be trusted.`});
+      }
+      const pk = await crypto.subtle.importKey("spki", unb64(cert.publicKey), {name:"ECDSA",namedCurve:"P-256"}, false, ["verify"]);
+      const ok = await crypto.subtle.verify({name:"ECDSA",hash:"SHA-256"}, pk, unb64(vSig), new TextEncoder().encode(vMsg));
+      setVerdict(ok
+        ? {k:"ok",  title:"Authentic", body:`Signed by ${cert.subjectName}, whose certificate is valid on chain.`}
+        : {k:"bad", title:"Invalid",   body:"The signature does not match this message and public key. The message was altered, or a different key signed it."});
+    }catch(e){
+      setVerdict({k:"bad", title:"Could not verify", body: e.reason || e.shortMessage || e.message});
+    }
+    setVBusy(false);
+  };
+
+  const vTone = {ok:TONE.valid, bad:TONE.revoked, warn:TONE.expired};
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-[32px] font-extrabold text-ink tracking-tight">Signatures</h1>
+        <p className="text-[14.5px] text-muted mt-1 max-w-[62ch]">
+          This is what a PKI is actually for. Sign something with your private key, then let
+          anyone check it against the public key stored on the blockchain.
+        </p>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-6 items-start">
+        <Panel title="Sign" lead="Load your key file and sign a message. Nothing leaves this browser.">
+          <Field label="Private key file">
+            <input type="file" accept=".json,application/json" onChange={loadKey}
+              className="block w-full text-[13px] text-muted file:mr-3 file:rounded-xl file:border-0 file:bg-shell-900 file:px-4 file:py-2.5 file:text-[13px] file:font-semibold file:text-white hover:file:bg-shell-800 cursor-pointer" />
+          </Field>
+          <Field label="Message">
+            <textarea className={areaCls} value={msgIn} onChange={e=>setMsgIn(e.target.value)}
+              placeholder="e.g. Transfer approved — Aarthi" />
+          </Field>
+          <Button kind="success" onClick={sign}>Sign message</Button>
+          {sig && (
+            <div className="mt-5">
+              <Field label="Signature — base64">
+                <textarea readOnly value={sig} className={areaCls} />
+              </Field>
+            </div>
+          )}
+          <Notice tone={note?.tone}>{note?.text}</Notice>
+        </Panel>
+
+        <Panel title="Verify" lead="Fetches the signer's public key from contract, checks validity, then checks signature.">
+          <Field label="Signer's certificate number">
+            <input type="number" min="1" className={inputCls} value={vId} onChange={e=>setVId(e.target.value)} placeholder="e.g. 1" />
+          </Field>
+          <Field label="Message">
+            <textarea className={areaCls} value={vMsg} onChange={e=>setVMsg(e.target.value)} />
+          </Field>
+          <Field label="Signature">
+            <textarea className={areaCls} value={vSig} onChange={e=>setVSig(e.target.value)} />
+          </Field>
+          <Button onClick={verify} busy={vBusy}>Verify signature</Button>
+
+          {verdict && (
+            <div className={`mt-6 rounded-2xl border ${vTone[verdict.k].border} ${vTone[verdict.k].bg} p-6 shadow-sm`}>
+              <p className={`text-[26px] font-extrabold leading-none ${vTone[verdict.k].text}`}>{verdict.title}</p>
+              <p className="text-[13.5px] font-medium text-ink mt-2">{verdict.body}</p>
+            </div>
+          )}
+        </Panel>
+      </div>
+
+      <div className="rounded-2xl border border-line bg-card p-6 shadow-sm">
+        <h3 className="text-[18px] font-bold text-ink">Try this in your demo</h3>
+        <p className="text-[13.5px] text-muted mt-2 max-w-[68ch] leading-relaxed">
+          Sign a message and verify it — authentic. Change one character of the message and verify
+          again — invalid. Then revoke the certificate and verify the original, untouched signature
+          one more time. It is still cryptographically perfect, and it is still rejected. That is
+          revocation working, and it takes about ninety seconds to show.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════ Navigation Config ═══════════════ */
+const NAV = [
+  { id:'overview',   label:'Overview' },
+  { id:'keys',       label:'Keys' },
+  { id:'issue',      label:'Issue' },
+  { id:'certs',      label:'Certificates' },
+  { id:'verify',     label:'Verify' },
+  { id:'signatures', label:'Signatures' }
+];
+
+/* ═══════════════ Shell Application ═══════════════ */
+function App(){
+  const { account, chainOk, connect, switchToSepolia, demo, setDemo } = useChain();
+  const { session, ready, setSession } = useAuthSession();
+  const [view,setView]     = useState('overview');
+  const [stashed,setStash] = useState("");
+  const [open,setOpen]     = useState(false);
+  const [err,setErr]       = useState("");
+
+  const go = id => { setView(id); setOpen(false); };
+
+  const doConnect = async () => {
+    setErr("");
+    try { await connect(); } catch(e){ setErr(e.message); }
+  };
+
+  const doSwitch = async () => {
+    setErr("");
+    try { await switchToSepolia(); } catch(e){
+      setErr(e.code === 4902
+        ? "Sepolia is not available in MetaMask. Enable test networks in MetaMask, then try again."
+        : (e.message || "Could not switch MetaMask to Sepolia."));
+    }
+  };
+
+  const logout = async () => {
+    try { await signOut(); setSession(null); }
+    catch(e) { setErr(e.message); }
+  };
+
+  return (
+    <div className="w-full max-w-none bg-card border-0 rounded-none overflow-hidden shadow-2xl flex flex-col lg:flex-row min-h-screen">
+
+      {/* Sidebar matching exact UI */}
+      <aside className={`${open?'block':'hidden'} lg:flex w-full lg:w-[240px] shrink-0 bg-card border-b lg:border-b-0 lg:border-r border-darkborder p-5 flex-col justify-between`}>
+        <div className="space-y-6">
+          {/* Logo */}
+          <div className="space-y-1">
+            <div className="flex items-center gap-2.5">
+              <LogoIcon />
+              <span className="text-[24px] font-black tracking-tight text-ink">Vouchr</span>
+            </div>
+            <p className="text-[12px] text-muted font-medium">Decentralized certificate registry</p>
+          </div>
+
+          {/* Navigation Links */}
+          <nav className="space-y-1.5">
+            {NAV.map(n => {
+              const active = view === n.id;
+              const Icon = NavIconsMap[n.id];
+              return (
+                <button key={n.id} onClick={()=>go(n.id)}
+                  className={`w-full flex items-center gap-3 rounded-2xl px-4 py-3 text-[14.5px] font-bold transition ${
+                    active ? "bg-shell-900 text-white shadow-md" : "text-ink hover:bg-lilac/50"
+                  }`}>
+                  <span className={active ? "text-white" : "text-ink"}><Icon /></span>
+                  <span>{n.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Dashed divider line */}
+          <div className="border-t border-dashed border-[#D5CBE5] my-4" />
+
+          {/* Demo Mode Toggle */}
+          <div className="space-y-2 px-1">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <div className="relative inline-flex items-center">
+                <input type="checkbox" checked={demo} onChange={e=>setDemo(e.target.checked)} className="sr-only peer" />
+                <div className="w-10 h-5 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-shell-900"></div>
+              </div>
+              <span className="text-[14px] font-bold text-ink">Demo mode</span>
+            </label>
+            <p className="text-[11.5px] text-muted leading-snug">
+              Sample data, no network. Useful if the venue Wi-Fi fails.
+            </p>
+          </div>
+          <div className="mt-6 space-y-2 border-t border-line pt-5 text-sm">
+            {!ready ? <p className="text-muted">Checking account…</p> : session ? <>
+              <p className="font-bold text-ink">{session.displayName || "Admin"}</p>
+              <p className="font-mono text-xs text-muted">{short(session.address)}</p>
+              {session.role === "admin"
+                ? <Link href="/admin" className="block font-semibold text-shell-900 underline">Admin dashboard</Link>
+                : <Link href="/recovery" className="block font-semibold text-shell-900 underline">Recover vault access</Link>}
+              <button onClick={logout} className="font-semibold text-seal underline">Sign out</button>
+            </> : <>
+              <Link href="/login" className="block font-bold text-shell-900 underline">User sign in</Link>
+              <Link href="/signup" className="block font-bold text-shell-900 underline">Create account</Link>
+              <Link href="/admin/login" className="block text-muted underline">Admin sign in</Link>
+            </>}
+          </div>
+        </div>
+
+        {/* Bottom Contract Badge in Sidebar */}
+        <div className="mt-8 rounded-2xl border border-line bg-lilac/70 p-3.5 space-y-1">
+          <div className="flex items-center justify-between text-ink">
+            <div className="flex items-center gap-2">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+              <span className="text-[12px] font-bold">Contract</span>
+            </div>
+            <a href={`https://sepolia.etherscan.io/address/${CONTRACT_ADDRESS}`} target="_blank" rel="noopener" className="text-muted hover:text-ink">
+              <ExternalLinkIcon />
+            </a>
+          </div>
+          <p className="font-mono text-[11.5px] font-bold text-ink truncate">{short(CONTRACT_ADDRESS)}</p>
+          <p className="text-[11px] text-muted">on Sepolia</p>
+        </div>
+      </aside>
+
+      {/* Main Content Area */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {/* Top Header Bar */}
+        <header className="px-6 py-4 flex items-center justify-between gap-4">
+          <button onClick={()=>setOpen(o=>!o)} className="lg:hidden rounded-xl border border-line bg-white px-3.5 py-2 text-[13px] font-bold text-ink">
+            Menu
+          </button>
+
+          {/* Header Contract Badge Pill */}
+          <div className="hidden sm:flex items-center gap-2 rounded-2xl border border-[#D5C8F2] bg-lilac/70 px-4 py-2 text-[13px]">
+            <span className="text-muted font-medium">Contract</span>
+            <span className="font-mono font-bold text-ink">{short(CONTRACT_ADDRESS)}</span>
+            <span className="text-muted">on Sepolia</span>
+          </div>
+
+          <div className="flex items-center gap-3 ml-auto">
+            {/* Network pill */}
+            <div className="flex items-center gap-2 rounded-2xl border border-line bg-white px-3.5 py-2 text-[13px] font-semibold text-ink shadow-sm">
+              <EthDiamondIcon />
+              <span>{account && !chainOk ? "Wrong network" : "Sepolia"}</span>
+              <span className={`h-2 w-2 rounded-full ${account && !chainOk ? "bg-red-500" : "bg-emerald-500"}`} />
+            </div>
+
+            {/* Connect wallet button */}
+            {account ? (
+              <div className="flex items-center gap-2 rounded-2xl border border-line bg-shell-900 px-4 py-2 text-[13px] font-bold text-white shadow-sm">
+                <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                <span className="font-mono">{short(account)}</span>
+              </div>
+            ) : (
+              <button onClick={doConnect} className="flex items-center gap-2 rounded-2xl bg-shell-900 hover:bg-shell-800 text-white px-4 py-2 text-[13.5px] font-bold transition shadow-sm">
+                <WalletIcon />
+                <span>Connect wallet</span>
+              </button>
+            )}
+          </div>
+        </header>
+
+        {err && <div className="mx-6 my-2 rounded-xl border border-seal-border bg-seal-light px-4 py-3 text-[13.5px] text-seal">{err}</div>}
+        {account && !chainOk && (
+          <div className="mx-6 my-2 rounded-xl border border-brass-border bg-brass-light px-4 py-3 text-[13.5px] text-brass flex flex-wrap items-center gap-3">
+            <span>MetaMask is on the wrong network. Switch it to Sepolia to issue or revoke certificates.</span>
+            <button onClick={doSwitch} className="rounded-lg bg-brass px-3 py-1.5 font-bold text-white">Switch to Sepolia</button>
+          </div>
+        )}
+
+        {/* Main Body */}
+        <main className="p-6 lg:p-8 flex-1">
+          {view==='overview'   && <Overview go={go} />}
+          {view==='keys'       && <Keys stash={setStash} />}
+          {view==='issue'      && <Issue stashed={stashed} go={go} />}
+          {view==='certs'      && <Certificates />}
+          {view==='verify'     && <Verify />}
+          {view==='signatures' && <Signatures />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+export default function Vouchr() {
+  return <SessionProvider><ChainProvider><App /></ChainProvider></SessionProvider>;
+}

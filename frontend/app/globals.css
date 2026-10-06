@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #d4c5f3;
+  color: #1e102a;
+  font-family: Inter, system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+.guilloche {
+  background-image:
+    repeating-radial-gradient(circle at 0% 50%, transparent 0 8px, rgba(111, 82, 157, .055) 8px 9px),
+    repeating-radial-gradient(circle at 100% 50%, transparent 0 8px, rgba(111, 82, 157, .055) 8px 9px);
+}
+
+@keyframes stamp {
+  0% { transform: scale(1.6) rotate(-14deg); opacity: 0; }
+  55% { transform: scale(.94) rotate(3deg); opacity: 1; }
+  100% { transform: scale(1) rotate(0deg); opacity: 1; }
+}
+
+.stamp { animation: stamp .42s cubic-bezier(.2, .9, .3, 1.1) both; }
+@media (prefers-reduced-motion: reduce) { .stamp { animation: none; } }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #c8bed8; border-radius: 10px; }
+:focus-visible { outline: 2px solid #2d193e; outline-offset: 2px; }
