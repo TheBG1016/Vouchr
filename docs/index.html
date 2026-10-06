@@ -93,6 +93,7 @@ const CONTRACT_ADDRESS = "0x933958160a0fFb81daf4C5F10cabc08bbd1718FF";
 
 const PUBLIC_RPC    = "https://ethereum-sepolia-rpc.publicnode.com";
 const SEPOLIA_CHAIN = 11155111n;
+const SEPOLIA_CHAIN_HEX = "0xaa36a7";
 const CONFIGURED    = !CONTRACT_ADDRESS.startsWith("PASTE");
 
 const ABI = [
@@ -158,13 +159,45 @@ function ChainProvider({children}){
     setSigner(s); setAccount(await s.getAddress()); setChainOk(n.chainId === SEPOLIA_CHAIN);
   }, []);
 
+  const switchToSepolia = async () => {
+    if (!window.ethereum) throw new Error("MetaMask is not installed in this browser.");
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_CHAIN_HEX }]
+    });
+  };
+
   useEffect(() => {
-    window.ethereum?.on?.('accountsChanged', () => location.reload());
-    window.ethereum?.on?.('chainChanged',   () => location.reload());
+    const onAccountsChanged = () => location.reload();
+    const onChainChanged = async chainId => {
+      setChainOk(BigInt(chainId) === SEPOLIA_CHAIN);
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        if (!accounts.length) { setSigner(null); setAccount(null); return; }
+        const p = new ethers.BrowserProvider(window.ethereum);
+        const s = await p.getSigner();
+        setSigner(s); setAccount(await s.getAddress());
+      } catch {
+        setSigner(null); setAccount(null);
+      }
+    };
+    window.ethereum?.on?.('accountsChanged', onAccountsChanged);
+    window.ethereum?.on?.('chainChanged', onChainChanged);
+    return () => {
+      window.ethereum?.removeListener?.('accountsChanged', onAccountsChanged);
+      window.ethereum?.removeListener?.('chainChanged', onChainChanged);
+    };
   }, []);
 
   const read  = () => new ethers.Contract(CONTRACT_ADDRESS, ABI, new ethers.JsonRpcProvider(PUBLIC_RPC));
-  const write = () => { if(!signer) throw new Error("Connect your wallet first."); return new ethers.Contract(CONTRACT_ADDRESS, ABI, signer); };
+  const write = async () => {
+    if (!signer) throw new Error("Connect your wallet first.");
+    const chainId = await window.ethereum.request({ method: "eth_chainId" });
+    if (BigInt(chainId) !== SEPOLIA_CHAIN) {
+      throw new Error("Switch MetaMask to Sepolia before issuing or revoking certificates.");
+    }
+    return new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+  };
 
   const api = useMemo(() => ({
     async list(){
@@ -186,7 +219,7 @@ function ChainProvider({children}){
         setDemoCerts(p => [...p, cert]);
         return { id:id.toString(), hash:null };
       }
-      const c  = write();
+      const c  = await write();
       const tx = await c.issueCertificate(name, key, days);
       const r  = await tx.wait();
       let id = "?";
@@ -200,13 +233,13 @@ function ChainProvider({children}){
         setDemoCerts(p => p.map(c => c.id === BigInt(id) ? {...c, revoked:true, revocationReason:reason} : c));
         return { hash:null };
       }
-      const tx = await write().revokeCertificate(id, reason);
+      const tx = await (await write()).revokeCertificate(id, reason);
       await tx.wait();
       return { hash: tx.hash };
     }
   }), [demo, demoCerts, account, signer]);
 
-  return <Chain.Provider value={{account,chainOk,demo,setDemo,connect,api}}>{children}</Chain.Provider>;
+  return <Chain.Provider value={{account,chainOk,demo,setDemo,connect,switchToSepolia,api}}>{children}</Chain.Provider>;
 }
 
 /* ═══════════════ SVG Icons ═══════════════ */
@@ -718,7 +751,7 @@ function Keys({stash}){
 
 /* ═══════════════ 3. Issue ═══════════════ */
 function Issue({stashed, go}){
-  const { api, demo, account } = useChain();
+  const { api, demo, account, chainOk } = useChain();
   const [name,setName] = useState("");
   const [key,setKey]   = useState(stashed || "");
   const [days,setDays] = useState(365);
@@ -732,6 +765,7 @@ function Issue({stashed, go}){
     if (!key.trim())   return setMsg({tone:"warn", text:"Generate or paste a public key."});
     if (!(days>=1 && days<=3650)) return setMsg({tone:"warn", text:"Validity must be between 1 and 3650 days."});
     if (!demo && !account) return setMsg({tone:"warn", text:"Connect your wallet before issuing."});
+    if (!demo && !chainOk) return setMsg({tone:"warn", text:"Switch MetaMask to Sepolia before issuing."});
 
     setBusy(true); setMsg({tone:"info", text:"Confirm the transaction in MetaMask…"});
     try{
@@ -1086,7 +1120,7 @@ const NAV = [
 
 /* ═══════════════ Shell Application ═══════════════ */
 function App(){
-  const { account, chainOk, connect, demo, setDemo } = useChain();
+  const { account, chainOk, connect, switchToSepolia, demo, setDemo } = useChain();
   const [view,setView]     = useState('overview');
   const [stashed,setStash] = useState("");
   const [open,setOpen]     = useState(false);
@@ -1097,6 +1131,15 @@ function App(){
   const doConnect = async () => {
     setErr("");
     try { await connect(); } catch(e){ setErr(e.message); }
+  };
+
+  const doSwitch = async () => {
+    setErr("");
+    try { await switchToSepolia(); } catch(e){
+      setErr(e.code === 4902
+        ? "Sepolia is not available in MetaMask. Enable test networks in MetaMask, then try again."
+        : (e.message || "Could not switch MetaMask to Sepolia."));
+    }
   };
 
   return (
@@ -1186,8 +1229,8 @@ function App(){
             {/* Network pill */}
             <div className="flex items-center gap-2 rounded-2xl border border-line bg-white px-3.5 py-2 text-[13px] font-semibold text-ink shadow-sm">
               <EthDiamondIcon />
-              <span>Sepolia</span>
-              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              <span>{account && !chainOk ? "Wrong network" : "Sepolia"}</span>
+              <span className={`h-2 w-2 rounded-full ${account && !chainOk ? "bg-red-500" : "bg-emerald-500"}`} />
             </div>
 
             {/* Connect wallet button */}
@@ -1207,8 +1250,9 @@ function App(){
 
         {err && <div className="mx-6 my-2 rounded-xl border border-seal-border bg-seal-light px-4 py-3 text-[13.5px] text-seal">{err}</div>}
         {account && !chainOk && (
-          <div className="mx-6 my-2 rounded-xl border border-brass-border bg-brass-light px-4 py-3 text-[13.5px] text-brass">
-            MetaMask is on the wrong network. Switch it to Sepolia to issue or revoke certificates.
+          <div className="mx-6 my-2 rounded-xl border border-brass-border bg-brass-light px-4 py-3 text-[13.5px] text-brass flex flex-wrap items-center gap-3">
+            <span>MetaMask is on the wrong network. Switch it to Sepolia to issue or revoke certificates.</span>
+            <button onClick={doSwitch} className="rounded-lg bg-brass px-3 py-1.5 font-bold text-white">Switch to Sepolia</button>
           </div>
         )}
 
